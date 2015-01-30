@@ -7,7 +7,7 @@ rsrc = resource.RLIMIT_DATA
 limit = int(1e9)
 resource.setrlimit(rsrc, (limit, limit))
 
-from opt_einsum import opt_einsum
+from opt_einsum import contract
 pd.set_option('display.width', 200)
 
 # Number of dimensions
@@ -71,7 +71,7 @@ for x in range(200):
         continue
 
     try:
-        opt = opt_einsum(sum_string, *views)
+        opt = contract(sum_string, *views)
     except Exception as error:
         out.append(['Opt_einsum failed', sum_string, index_size, 0, 0])
         continue
@@ -82,24 +82,24 @@ for x in range(200):
         out.append(['Comparison failed', sum_string, index_size, 0, 0])
         continue
 
-    setup = "import numpy as np; from opt_einsum import opt_einsum; \
+    setup = "import numpy as np; from opt_einsum import contract; \
              from __main__ import sum_string, views"
     einsum_string = "np.einsum(sum_string, *views)"
-    opt_einsum_string = "opt_einsum(sum_string, *views)"
+    contract_string = "contract(sum_string, *views)"
 
     e_n = 1
     o_n = 5
     einsum_time = timeit.timeit(einsum_string, setup=setup, number=e_n) / e_n
-    opt_einsum_time = timeit.timeit(opt_einsum_string, setup=setup, number=o_n) / o_n
+    contract_time = timeit.timeit(contract_string, setup=setup, number=o_n) / o_n
 
-    out.append([ident, sum_string, index_size, einsum_time, opt_einsum_time])
+    out.append([ident, sum_string, index_size, einsum_time, contract_time])
 
 df = pd.DataFrame(out)
 df.columns = ['Flag', 'String', 'Shapes', 'Einsum time', 'Opt_einsum time']
 df['Ratio'] = df['Einsum time']/df['Opt_einsum time']
 
 diff_flags = df['Flag']!=True
-print '\nNumber of opt_einsum different than einsum: %d.' % np.sum(diff_flags)
+print '\nNumber of contract different than einsum: %d.' % np.sum(diff_flags)
 if sum(diff_flags)>0:
     print 'Terms different than einsum'
     print df[df['Flag']!=True]
@@ -107,7 +107,7 @@ if sum(diff_flags)>0:
 print '\nDescription of speedup in relative terms:'
 print df['Ratio'].describe()
 
-print '\nNumber of opt_einsum slower than einsum:   %d.' % np.sum(df['Ratio']<0.90)
+print '\nNumber of contract slower than einsum:   %d.' % np.sum(df['Ratio']<0.90)
 tmp = df.loc[df['Ratio']<0.90].copy()
 tmp['Diff (us)'] = np.abs(tmp['Einsum time'] - tmp['Opt_einsum time'])*1e6
 tmp = tmp.sort('Diff (us)', ascending=False)

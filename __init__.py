@@ -1,1 +1,1 @@
-from opt_einsum import opt_einsum
+from opt_einsum import contract

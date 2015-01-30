@@ -3,7 +3,7 @@ import pandas as pd
 import sys, traceback
 import timeit
 import test_helper as th
-from opt_einsum import opt_einsum
+from opt_einsum import contract
 pd.set_option('display.width', 200)
 pd.set_option('display.max_rows', 200)
 
@@ -38,7 +38,7 @@ for key in th.tests.keys():
             continue
 
         try:
-            opt = opt_einsum(sum_string, *views, path=opt_path)
+            opt = contract(sum_string, *views, path=opt_path)
         except Exception as error:
             out.append([key, 'Opt_einsum failed', sum_string, scale, 0, 0])
             continue
@@ -47,19 +47,19 @@ for key in th.tests.keys():
             out.append([key, 'Comparison failed', sum_string, scale, 0, 0])
             continue
 
-        setup = "import numpy as np; from opt_einsum import opt_einsum; \
+        setup = "import numpy as np; from opt_einsum import contract; \
                  from __main__ import sum_string, views, opt_path"
         einsum_string = "np.einsum(sum_string, *views)"
-        opt_einsum_string = "opt_einsum(sum_string, *views, path=opt_path)"
+        contract_string = "contract(sum_string, *views, path=opt_path)"
 
 
         # How many times to test each expression, einsum will be significantly slower
         e_n = 1
         o_n = 3
         einsum_time = timeit.timeit(einsum_string, setup=setup, number=e_n) / e_n
-        opt_einsum_time = timeit.timeit(opt_einsum_string, setup=setup, number=o_n) / o_n
+        contract_time = timeit.timeit(contract_string, setup=setup, number=o_n) / o_n
 
-        out.append([key, 'True', sum_string, scale, einsum_time, opt_einsum_time])
+        out.append([key, 'True', sum_string, scale, einsum_time, contract_time])
 
 df = pd.DataFrame(out)
 df.columns = ['Key', 'Flag', 'String', 'Scale', 'Einsum time', 'Opt_einsum time']
@@ -72,9 +72,9 @@ print df
 
 num_failed = (df['Flag']!='True').sum()
 if num_failed>0:
-    print 'WARNING! %d opt_einsum operations failed.' % num_failed 
+    print 'WARNING! %d contract operations failed.' % num_failed 
 
 print '\nDescription of speedup:'
 print df['Ratio'].describe()
-print '\nNumber of opt_einsum slower than optimal: %d.' % np.sum(df['Ratio']<0.90)
+print '\nNumber of contract slower than optimal: %d.' % np.sum(df['Ratio']<0.90)
 

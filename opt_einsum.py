@@ -133,7 +133,7 @@ def _path_opportunistic(inp, out, ind_dict, memory):
 
 
 # Rewrite einsum to handle different cases
-def opt_einsum(string, *views, **kwargs):
+def contract(string, *views, **kwargs):
     """
     Attempts to contract tensors in an optimal order using both
     np.einsum and np.tensordot. Primarily aims at reducing the

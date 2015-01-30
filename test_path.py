@@ -5,7 +5,7 @@ import timeit
 import time
 
 import test_helper as th
-from opt_einsum import opt_einsum
+from opt_einsum import contract
 pd.set_option('display.width', 200)
 
 import resource
@@ -30,9 +30,9 @@ for key in th.tests.keys():
 
         # At this point lets assume everything works correctly
         t = time.time()
-        opt_path = opt_einsum(sum_string, *views, path='optimal', return_path=True)
+        opt_path = contract(sum_string, *views, path='optimal', return_path=True)
         opt_time = time.time() - t
-        opp_path = opt_einsum(sum_string, *views, path='opportunistic', return_path=True)
+        opp_path = contract(sum_string, *views, path='opportunistic', return_path=True)
         if opt_path_time and (len(views) > term_thresh):
             print 'Path optimal took %3.5f seconds for %d terms.' % (opt_time, len(views))
 
@@ -40,15 +40,15 @@ for key in th.tests.keys():
         if all(x==y for x, y in zip(opp_path, opt_path)):
             break
 
-        setup = "import numpy as np; from opt_einsum import opt_einsum; \
+        setup = "import numpy as np; from opt_path import contract; \
                  from __main__ import sum_string, views, opt_path, opp_path, tdot"
-        opportunistic_string = "opt_einsum(sum_string, *views, path=opp_path, tensordot=tdot)"
-        optimal_string = "opt_einsum(sum_string, *views, path=opt_path, tensordot=tdot)"
+        opportunistic_string = "contract(sum_string, *views, path=opp_path, tensordot=tdot)"
+        optimal_string = "contract(sum_string, *views, path=opt_path, tensordot=tdot)"
 
         # Optional test
         if test_paths:
-            opp = opt_einsum(sum_string, *views, path=opp_path)
-            opt = opt_einsum(sum_string, *views, path=opt_path)
+            opp = contract(sum_string, *views, path=opp_path)
+            opt = contract(sum_string, *views, path=opt_path)
             assert np.allclose(opp, opt)
         if test_einsum and test_paths:
             assert np.allclose(opp, np.einsum(sum_string, *views))

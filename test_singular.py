@@ -3,7 +3,8 @@ import pandas as pd
 import time
 
 import test_helper as th
-from opt_einsum import opt_einsum
+
+from opt_einsum import contract
 pd.set_option('display.width', 1000)
 
 ### Start variables
@@ -34,12 +35,12 @@ print '\nEinsum took %3.5f seconds.\n' % (time.time() - t)
 
 t = time.time()
 print 'Building path...'
-path = opt_einsum(sum_string, *views, path=path_arg, return_path=True)
+path = contract(sum_string, *views, path=path_arg, return_path=True)
 print 'Path: ', path
 print '...path %s took %3.5f seconds.\n' % (path_arg, (time.time() - t))
 
 t = time.time()
-opt_ein_result = opt_einsum(sum_string, *views, debug=1, path=path)
+opt_ein_result = contract(sum_string, *views, debug=1, path=path)
 print 'Opt_einsum took %3.5f seconds' % (time.time() - t)
 
 
