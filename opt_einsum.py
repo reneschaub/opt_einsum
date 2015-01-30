@@ -194,7 +194,6 @@ def contract(string, *views, **kwargs):
     indices = set(input_string.replace(',', ''))
 
     # TODO Should be cast up to double precision
-    arr_dtype = np.result_type(*views)
     views = [np.asanyarray(v, dtype=arr_dtype) for v in views]
 
     # Make sure number views is equivalent to the number of terms
