@@ -35,7 +35,10 @@ def parse_einsum_input(operands):
 
     if isinstance(operands[0], str):
         subscripts = operands[0].replace(" ", "")
-        operands = [np.asanyarray(v) for v in operands[1:]]
+        #!when would the input ever not be an array? At least since it's cuda it will be, here
+        #-can't do that with device arrays
+        #operands = [np.asanyarray(v) for v in operands[1:]]
+        operands = [v for v in operands[1:]]
 
         # Ensure all characters are valid
         for s in subscripts:

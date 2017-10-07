@@ -3,6 +3,7 @@ from . import parser
 from . import blas
 import numpy as np
 
+
 def contract_path(*operands, **kwargs):
     """
     Evaluates the lowest cost einsum-like contraction order.
@@ -108,7 +109,6 @@ def contract_path(*operands, **kwargs):
     # Hidden option, only einsum should call this
     einsum_call_arg = kwargs.pop("einsum_call", False)
     use_blas = kwargs.pop('use_blas', True)
-
     # Python side parsing
     input_subscripts, output_subscript, operands = parser.parse_einsum_input(operands)
     subscripts = input_subscripts + '->' + output_subscript
@@ -362,7 +362,8 @@ def contract(*operands, **kwargs):
 
             # If out was specified, poor way of doing this at the moment
             if specified_out and ((num + 1) == len(contraction_list)):
-                out_array[:] = new_view
+                out_array.copy_to_device( new_view )
+#                out_array[:] = new_view
 
         else:
             # If out was specified
