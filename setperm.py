@@ -1,30 +1,50 @@
 import numpy as np
 import record
 import math
+#from numba import cuda, float32, int32
 import permutate
+import checkperm
 
-# Permutate indices of array A.
-# A: device array input in C order, Ap: device array for output 
-# index_from/to: einsum notation strings
-# A != Ap: no inline permutation allowed/possible. 
-# A.shape must be correct shape. Ap.shape is ignored, but be careful when using Ap as input to another permutation
+#A: device array input, permutation: cpu int array, Ap: device array for output, itemsize: byte size of element in A
+#index_from/to: einsum notation string
+#A != Ap: no inline permutation. Ap.shape is ignored (no need to reshape to the permutation order)
 def perm( A, index_from, Ap, index_to ) :
 
   #I don't have time to think through the trivial case failure (probably assuming inner/outer have at least one difference)
   if index_from == index_to :
     return
-  #assert( A.gpu_data != Ap.gpu_data )  #can't use this while in cuda simulator
+#  assert( A.gpu_data != Ap.gpu_data )  #can't use this while in simulator
 
   itemsize = A.dtype.itemsize
 
-  T = 20  #!debug testing default. Make this proper WARP size.
+ 
+  T = 20
+#  rN = 5
   rN = len(index_from)
+#  out = np.zeros(rN, dtype=int)
   out = parse( index_from, index_to ) 
+#  out[:] = [3,1,2,0,4]  #outvirt didn't look right
   shape = A.shape
+
+
+#  shape = np.zeros(rN, dtype=int)
+  #out[:] = [4,1,2,3,0]
+#  shape[:] = [6,40,10,3,3]
+  
+  #T = 20
+  #rN = 2
+  #out = np.zeros(rN, dtype=int)
+  ##out[:] = [3,1,2,0,4]  outvirt didn't look right
+  #shape = np.zeros(rN, dtype=int)
+  #out[:] = [1,0]
+  #shape[:] = [100,100]
   
   shapeOut = np.zeros(rN, dtype=int)
   for i in range(rN) :
     shapeOut[i] = shape[ out[i] ]
+
+  #debug: ok stupid thing is I can't reshape Ap because it sends a result, not inline.
+  Apr = Ap.reshape( tuple(shapeOut), order='C' )
   
   N = 1
   for i in range(rN) :
@@ -37,10 +57,14 @@ def perm( A, index_from, Ap, index_to ) :
   #note ravel() will copy data if order is not same as stored order, while reshape will simply stride data differently. 
 
   #can't access _dummy in cuda simulator
-  #assert( A._dummy.flags['C_CONTIGUOUS'] ) 
+#  assert( A._dummy.flags['C_CONTIGUOUS'] )  #!for now. Could easily adjust striding in permutation
 
   fA = A.reshape( N, order='C' )  
   fAp = Ap.reshape( N, order='C' )
+#  A.shape  = (N,)
+#  Ap.shape = (N,)
+#  A.strides = (itemsize,)
+#  Ap.strides = (itemsize,)
  
   overlap = np.zeros(rN, dtype=int)
   #that's the specs.
@@ -52,6 +76,7 @@ def perm( A, index_from, Ap, index_to ) :
   mapr = np.zeros( rN+2, dtype=int ) #reverse map from virt to real with split indicators
   
   i = 1; m = 1
+#  while T // m != 0 and i <= rN :
   while 1.0 * T / m > 1.0 and i <= rN :
     inrc = m 
     m = m * shape[rN-i] 
@@ -59,13 +84,14 @@ def perm( A, index_from, Ap, index_to ) :
   inrN = i - 1 #inner read cube size
   assert( inrN <= rN )
   i = 1; m = 1
+#  while T // m != 0 and i <= rN :
   while 1.0 * T / m > 1.0 and i <= rN :
     inwc = m 
     m = m * shape[out[rN-i]] 
     i = i + 1
   inwN = i - 1 #inner write cube size
-
-  assert( inwN <= rN )
+  
+  
   #mode overlap: the inner always owns the overlap  
   #!also redundant with other block that uses it. only need virtual overlap
   for i in range(1,inwN+1) :
@@ -88,6 +114,7 @@ def perm( A, index_from, Ap, index_to ) :
       innerWrite[0] = rN-inwN + 2 #reflects the split ind -> ind, ind+1, ind+2
       readExtra, writeExtra = 1, 0
   
+   
     else : #inwc <= inrc:
       s1s = T // inrc 
       s2s = T // (s1s*inwc) 
@@ -244,18 +271,30 @@ def perm( A, index_from, Ap, index_to ) :
       j = j + 1
   assert( j == rN+2 )
   
+  #--------------------------------
+  #ok send a sample matrix
+  
+#  A = np.arange(N, dtype='float32') #.reshape(10,10,10,10)
+#  C = np.zeros(N, dtype='float32')  #.reshape(10,10,10,10)
+  
+#  Ad = cuda.to_device(A)
+#  Cd = cuda.to_device(C)
+  
   p = record.parg( innerReadN=innerReadN, outerReadN=outerReadN, innerWriteN=innerWriteN, outerWriteN=outerWriteN
                  , blockN=blockN,  virtualN=rN+2, realN=rN )
   p['shape'] = shape 
   p['shapeVirt'] = shapeVirt 
-  p['mapVirt'] = mapr 
+  p['mapVirt'] = mapr #right virt is mapped to orig, left to inner=-1/outer=-2 virt
   ps = p['shape']
+  #si = A.dtype.itemsize
   si = 1
+  #p['strides'] = [40000,4000,400,40,4]
+  
   
   p['strides'][rN-1] = si
   for i in range( rN-2,-1,-1 ) :
     p['strides'][i] = p['shape'][i+1] * p['strides'][i+1] 
-  p['T'] = Tf  
+  p['T'] = Tf  #!!mask out the smaller threads in gpu   !!also: -1/-2 meaning change, only -2 when left double split
   p['out'] = out 
   p['outVirt'] = outVirt
   #inner/outer virt are the real indices that get split
@@ -269,21 +308,27 @@ def perm( A, index_from, Ap, index_to ) :
         innerVirt = mapr[i+1]
   p['innerVirt'] = innerVirt #wrt real 
   p['outerVirt'] = outerVirt
-  p['innerRead'] = innerRead[:innerReadN]  
-  p['outerRead'] = outerRead[:outerReadN]  
+  p['innerRead'] = innerRead[:innerReadN]  #first one always virtual.
+  p['outerRead'] = outerRead[:outerReadN]  #first one always virtual (possibly on top of virtual, or last one is virtual.
   p['innerWrite'] = innerWrite[:innerWriteN]
   p['outerWrite'] = outerWrite[:outerWriteN]
   p['block'] = block[:blockN]  #order arbitrary
   blocks = 1
   for i in range( blockN ) :
     blocks = blocks * shapeVirt[ block[i] ]
+  #griddim (number of blocks), blockdim (threads per block), stream, sharedmem
   
   from pdb import set_trace; set_trace()
+  #permutate.perm[ blocks, Tf, 0, Tf*Tf * A.dtype.itemsize ]( Ad, Cd, p)  #Tf*Tf is upper bound when no overlap
   permutate.perm[ blocks, Tf, 0, Tf*Tf * itemsize ]( fA, fAp, p)  #Tf*Tf is upper bound when no overlap
 
   #debug
   Ap_ = Ap.copy_to_host()
+  Apr_ = Apr.copy_to_host()
   A_ = A.copy_to_host()
+
+  checkperm.checkperm( A_, shape, Ap_, tuple(shapeOut), out )  
+
 
 
 #assumes no repeated indices and proper permutation
@@ -296,3 +341,4 @@ def parse( index_from, index_to ) :
     out[i] = map_index[ index_to[i] ]  
   return out
 
+# 
