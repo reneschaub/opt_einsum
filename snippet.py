@@ -45,11 +45,12 @@ def setperm( ) :
   blocks = 3
   perm[ blocks, Tf, 0, Tf*Tf * itemsize ]( p )
 
-  print( p['pad'] )
+  if p['pad'][1] != p['pad'][0] :
+    print( 'syncthreads failed' )
+  else :
+    print( 'syncthreads success' )
 
 
 setperm( )
-
-print('success')
 
 
