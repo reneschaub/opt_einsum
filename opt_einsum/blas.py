@@ -1,6 +1,7 @@
 import numpy as np
 from . import paths
-from accelerate.cuda.blas import Blas
+#from accelerate.cuda.blas import Blas   not certified with latest numba versions
+from pyculib.blas import Blas
 
 from numba import cuda, float32 #, int32
 import setperm
