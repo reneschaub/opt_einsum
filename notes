@@ -1,0 +1,304 @@
+shared memory for compute 6 and 5:
+32 banks (each bank is seperate memory module, so all can be accessed in parallel). They are mapped contiguously, ie +1 (32bit) address
+maps to the next bank and so on. bandwidth per module is 32bits. If the same address is requested, it is broadcast or written to without problem.
+(undefined if different).
+
+global padding: a matrix rows should be padded as multiples of 32 (warp) for coalescing. I guess this is the same trick as my virtual blocks,
+except they want it actually to be real blocks (not completely out of the question, given that copying tensor seems easy/fast, but this should
+all be done during the one-off cpu transfer). I don't quite understand why apparently the warp should be aligned on 32*32bit, especially
+since it has nothing to do with the gddr5 bandwidth (seems to be 12*32), but for now I can just test for arrays that are multiples of 32 in each dim
+All global memory accesses are aligned to at least 256 bytes = 4*64. Well that in itself requires the 32* padding if not more 
+ Global accesses are all cached in L2, and L1 if read only (may have to mark?). In any case, since global is only read once here sequentially,
+and written anyhow sequentially, caching is of no concern, except when there is bad coalescing which I don't want anyhow.
+Somewhere it then says L2 lines are 32 bytes (now that would match) transactions vs L1 being 128 bytes. Since L1 is also shared mem, there
+are the 32 banks again.
+
+SO the trick is: for global memory, the threads have to line up in order (so that the individual accesses can be collected into contiguous access
+- I mean I assume a permutation also would work maybe they imply that in the coalesce, but who cares not useful),
+while the shared mem banks have looser requirement, to paraphrase, can coalesce modulo 32, and out of order (=being in different banks).
+This is the only reason the conumdrum of orthogonal access can be broken, by shifting rows by one so the columns become 45 degree, spread over
+banks.
+
+to have a multiple of 32 or 64, I can just pad the first in and out dimension, good bye long and skinny tensors. If there really 
+are skinny dimensions, simply choose the fattest one to be at the end in opt_einsum. Even if the original tensor says otherwise, I could
+do preprocessing to reshuffle it. Instead of having virtual blocks that are not 32 multiples, but rather multiples of inner blocks,
+I would first pad these inner virtual blocks to 32, in addition to the virtual split thereafter. But this would still not guarantee that the
+block to the right of the innermost out dimension (in the original shared memory permutation) is a multiple of 32, because that dim could be to
+right of inner read block. Simply put, that's the block I have to pad: to the right of first output dim (that changes! skipping stable dims).
+But if that block is huge, isn't global coalesce still going to fail on the nonaligned earlier dimensions? The warp global accesses have to 
+start on these 256 or 32 byte addresses, other than that why would there be a problem if all T threads are contiguous modulo mapping.
+The point of the 32 filler +1 would simply be to walk along the inner out dimension at +1 to get bank spread.
+
+For the orthogonal bank spread, I need to make the right-to-innermost-out block buffered, in shared memory only. I assume the modulo stuff will
+automatically align the global access as long as the tensor begins on a 32 multiple address.
+Could I get rid of the virtual stuff if I buffer teh first in/out dimensions? Yes but I can't contract the tensors with blas then.
+What about virtual padding but only on the first dim, so no split required. Also then size is T, not some arbitrary block size < T, 
+and then I don't have to pad the shared mem either for the striping other than the +1. Dropping the split machine and where it is would make
+a huge simplification. All I would have to do is change two strides to virtual (so still have virtual vs real).
+
+See if I need that simplification to pull off the local cascading (the +1 padding work requires more prep but about the same)
+Conclusion: no change other than the +1 padding on shared mem. Potential simplification dropping the splits.
+
+----
+>launch nvvp (from nvidia bin path, add, in test/a) with proper conda environment: doesn't pick it up, so I guess must either generate all needed files from nvprof then lauch nvvp with it, or install every package on the global environment like for n1 (clone it?)
+
+shared memory throughput is 600Mb/s, vs 600Gb/s for matrixMulCUBLAS. Also global load througput 10x higher latter. I can't be wasting 1000:1 on setting up stuff vs 1 shared mem write.
+----
+super slow (100x slower than the sgemm call, which should be slower).
+for some reason, isolate numba creates two host to device calls even though there is only one.
+
+>move p into shared memory? seems obvious to stop global access nonstop. Or just creating a scalar
+for each p access (eg loops), supposedly goes into register (why not automatically then)
+>get cuda book
+>do the metrics profile on the cublas sgemm: at least the total number of instructions should be bigger,
+and compare other metrics
+>have full activity, must be global p access and hopefully no stupid ss bank shit
+>achieved occupancy 20%.
+
+check for any cuda errors return codes that may not result in actual faults but disrupt the machinery.
+check other parameters for nvprof for more details (idle gpu)
+no streams use?
+am I somehow running same thing many times?
+If shared memory requires coalescing as well I'm screwed. I don't think so, so what are banks? Why does it
+git me cache missses, I'm only accessing L1 shared memory, it's supposed to be there..
+ for each ss mem access, there is 1000x more local writes. How can that be? setting up the address is a constant
+number of loops with each constant dimensions (4). Also, about 500x global load (p array. Includes perm array but that would have only as many as shared mem access) >p array should be read once into register memory, not cause global ref with cache misses.
+ Globaly memory load efficiency: 10% >that must be the damn p array
+ local memory overhead 90%
+-----
+the mem bug is cudatoolkit9. Which nvidia driver doesn't matter and is the same between 8 and 9. I have 
+cuda 9 installed and cudatoolkit 8 and it's fine (with the mem fix)
+-----
+ok on user 'a': downloaded test2 from ec2, which has isolate.py, a direct permutate call, except I already
+killed the code for that down to snippet level. Either go on EC2 and check for .vim files (I must have set this
+up like that otherwise couldd not have gone back) in test2. If lost, use the perm call just give full
+parameters and real permutate. Run with sim, this should show good while toolkit bad. Just give them that 
+case, it's proof enough that it's their fault and they already know its sync issue.
+------
+Installed nvidia cuda 9.1. Left cudatoolkit at 8.0 in conda and recompiled numba without fix. 
+Interestingly, snippet still works, so it does seem to be a change in the backend stuff. 
+------
+Ok works with 8.0 on my machine.
+-----
+384.111 works with cudatoolkit 9.0, 387.26 with cdk 9.1, but both give same cuda memcpy error on second.
+-check if anything in between happens in code, like cublas
+-find larger test case that fails (wihtout cublas) so can run sim again.
+Now the cuda installation itself..is it 9.1 or 9.0, but neither did work (unless better driver for 9.0 than one available - doubtful same error)
+-cuda 8 steps: install nvidia legacy cuda -> new driver I presume (maybe not), reboot > conda toolkit 8.0
+keep both cuda downloads and make bash script so I can switch between 8 and 9 installing. (I hope I don't 
+also have to switch linux kernel version).
+-main goal is first to proof of concept that 8 is still working on my machine vs. ec2
+------
+
+9 doesn't work:
+second perm gitve cumemcpydtoh launch failed (9.0 and 9.1) using master numba install with fix merged in.
+maybe it's a pyculib issue who knows (used pip and dependencies.
+it seems the fix works but now there are other problems in 9.
+
+-get a 8.0 install like in ec2 BUT need cuda 8.0 driver for that first (not the latest nvidia), check if the
+additional drivers other version is for 8.0. Check the numba version (conda list) on ec2 and everything else try to replicate exactly that
+>to make sure I can run anything at all on my 1080 ti properly.
+
+If that works, just stick with that and continue
+
+----------
+
+HURRAH: numba have fixed bug
+
+the effect is half the result matrix remains zero, the other half is correctly permuted
+for ijkl -> klij: every ij 4*5 end block last row i (3) is all 0, and (2,4) also (last entry of 3rd row)
+So for some reason, the indexed threads for these don't run or don't finish.
+klji:  still last 6 entries in the block
+iklj: [3,1:]  4 entries of lj block
+kilj: same. Also the zeros appear only in the block, sum is not half, much more.
+T<10: no problem, starts with T>=10. 15-19: only [2,4] missing (klij). T>=21 also no problem:
+the ij block is 4*5 = 20. If a whole block fits, no virtual or outer block is needed.
+
+debug: from double run, get proper value of missing location, then catch it
+last entry: 839, block 2. >>ok, when same block 2 write is processed and lasst entry of S (279) is
+written back to presumably right output location, S[v] is 0. So a) thread is not skipped, it is being 
+written, just it is 0, even though same block earlier set it to 839. S[279] is only written once in block 2
+(checked). After syncthreads all S set for block, entry is still 839.
+>>> thread 14-19 see 0 (they do execute), <14 sees correrct 839. This happens to be the inner read block T
+(inrbN). So what's happening is 14+ don't execute the read block, so race down and are not waiting for
+read to finish.
+I'm guessing there are too many if levels for CUDA or too long a block.
+(Note this is not the virtual blocks skip match, this is threads that are not running in read or write
+because read/write use different number of threads.)
+It's a ridiculous bug: if I remove too much AFTER reading S from dead read thread, it suddenly works.
+Even more ridiculous, it wants an if statement (to fail sync): even if if never executes, the following 
+statements are crucial to make sync fail...
+..Now I reduced it can remove all statements past sync write. But not beforee, only 1 after 1 in right order..
+
+4567
+Fails:
+ijkl -> kilj 
+     -> klij
+     -> iklj
+     -> ilkj
+     -> klji
+        jlik
+        
+works: jikl, jkil,  kjil, jilk,   
+looks like whenever j or i is last
+
+permutate.perm.definitions  (after call, shows the compiled signatures)
+rmutate.perm.inspect_types()  (gives all data types used/converted in source
+
+
+exact problem: when the cublas call is run, it destroys the numba permutation kernel somehow, 
+even though it is not clear why the final permutation post result still works. The next run fails the first
+permutation, but running again (ie without cublas call preceding) cures it.
+Also why is this happening now: apparently only in a test where permutation happens before blas,
+as before it was only a post operation. Alternative explanation could be that two different set perms
+don't work: try to stop it after blas, see if it kills it.
+Again: as soon as blas.gemm is called, running again the first permutation fails. So it seems to be that
+there is an exit problem, as the gemm call is followed by another perm fine.
+Yep, it's an exit condition: I repeated the same first perm call right after blas on new hold memory, and it checked out fine.
+Interesting: after
+sudo rmmod nvidia_uvm nvidia
+(sudo nvidia-smi)
+to shut down nvidia drivers (should boot up automatically on use), now unittest fails every time from command
+line. From ipython without exit, it still works the second time. (or did it always fail from command line???)
+ The thing is, it never works the first time (at which point the blas call hasn't even been used)
+Even when I boot it up, first time the perm fails out of the gate. So if that's true, just isolate the
+setperm call. Ok, booting first then setperm without importing accelerate: ipython, still fails! 
+Second time ok, and from then on fine as long as I don't call cublas. What's more disturbing than cublas
+is that if fails the first time period. To replicate behavior, shut down nvidia drivers.
+It only fixes itself the second time from ipython with modules still loaded. 
+ Another shitcrash: AFTER the shutting down of drivers, command line will always fail, BUT ipython fine second time. Before shutdown of drivers, command line ALSO works second time.
+ (the drivers remain in use during ipython session: then the command line also works. Once I end session, command line fails)
+
+
+https://github.com/numba/pyculib  instead of accelerate. Latter cublas seems to kill numba kernels when imported. Although supposedly are direct ports from accelerate, so may still do so.
+  >during successful test, I seem to have compiled it from source, as it shows as 'pip' in conda list, but maybe I did use pip.
+conda install pyculib
+(or: conda install -c anaconda accelerate_cudalib   not sure, older version? https://anaconda.org/anaconda/accelerate_cudalib)
+Another alternative is 
+pip install scikit-cuda
+IF USING PYCULIB INSTEAD OF ACCELERATE, REMOVE accelerate first and then can update numba to latest version
+(accelerate forced downgrade)
+
+CONT: -note down that g2 cuda fails some cases (when simulator works correctly)
+-review inrN vs innerReadN: why am I using both, is this consisten? If so, document code clearly
+ok bug was ceil using int instead of fractions. bugs today: that and synch and block and g2 bug and setting debug up
+both work now.
+>>>>remove the !!!! reshape from blas
+
+-shouldn't have to reshape to 1d outside of perm. do it in setperm (create a view)
+-pull request for anaconda cuda device reshape: don't skip when shape remains same but order doesn't.
+-the ints (index) are int64 (type(v)) in kernel. replace with 32.
+
+-make test cases easier to set up (auto sized of result etc)
+
+
+general tensor contraction: removed indices don't sit in an end block. Permutate into a default
+block (say right most), then apply gemm logic. Need to change output ind order accordingly so it gets
+picked up in final permut fallback. also input order so it gets processed by gemm
+
+variables: 
+index_result: eins string of output
+keep_left/right: char sets
+rs: N of contr indices
+dim_left/right/removed: correct remaining block size even if remaining indices are in any position
+tensor_result: output indices from tensordot func: left juxtaposed with right with contract ind removed.
+input_left/right: eins string input
+
+check: indices (see tensordot code) are contiguous and at beginning or end of input_left/right.
+How: set of indices is consecutive, and sequences are translated identical, that is, diff is same repeated
+constant. sorted sequence is either 0,1,... or ..,n-1,n. That is, smallest or largest sum of length rs,
+so n*(n-1)/2 or N*.. - (N-n) / (2N-(n-1))*n/2  (n is rs, and N is #len-1)
+if not, construct temp_input left/right string as left/right without contract (see tensor_result var code),
+and append contract string (any order but use same for left and right inputs.
+Apply permutate to input_,temp_input_. Can override input_/left_view etc now as substitutes. tensor_result
+is not relevant anymore as this is the replacement for this function, but track use of tensor_result.
+-check: he assumes gemm result is always in tensor_result form (left concat right) and reshapes into it.
+I guess that's true. Finally he morphs tensor_result into index_result (my permutation)
+
+
+--
+Aber permutate ist auch nicht schwer: die strides sind nur ein linearer map von multi-tuple auf flach.
+in prepperm die stride ist jetzt in C order, waere es ein F array dann einfach den umgekehrt mappen.
+Aber das problem ist ja dass die contiguous memory nur auf dem rechten zipfel angenommen ist, nicht
+links wie im F. Das ganze inner ist dann falsch. Man muesste eine reverse-permutation vornehmen um es in 
+C contig umzuwadeln, was nicht einfach eine transpose ist.
+
+Scheisse: stimmt es dass eine transpose eine F in C umwandelt, wenn es mehrere indices hat pro haelfte?
+ijkl in C waere lkji in F, also nicht kl,ij transpose. gemm ist ok mit blocks, die bleiben erhalten.
+einsum kuemmert sich nicht um strides, das spielt nur beim gemm eine rolle. also, will gemm,
+aber hab C. 
+nun gut:
+lk/ji, nm/lk  will ijkl,klmn. Mit transpose:
+ji/lk, lk/nm: block strides are irrelevant, they still match up for gemm. result:
+ji/nm, in F, which is the same as 
+mnij in C, also wirklich brauch ich nur eine transpose.
+
+--
+rewrite perm so can deal with F striding.
+
+shit the blas arrays are all 'F' strided. so the way stride info is used in kernel is incorrect, it would
+start from left not right.
+
+I guess I can pass dictionaries allowing changing of array pointers in function. 
+
+
+ok so can't use shape, it has to be 1d..but doesn't that screw me with blas it has hape?
+stupid, input arrays are supposed to be 1d since I access them as 1d..
+that Implies I change the cpu component for each einsum contraction. Well I already access a lot of cpu stuff each time
+anyway, so one more won't hurt, I think the type info is compiled anyhow only once, or is it.
+does einsum use shape anywhere? If not I can just make shape to be 1d or use a surrogate pointer with the
+cache that already has the 1d shape attached. definintely don't recompile because it has to check shape.
+----
+make a function out of prepperm, and call it in the last blas permute case.
+Ideally the kernel parameter record should be cached for given permute case so that on second run
+kernel can be called directly, by hashing permute case (don't need to normalize) and shape.
+This is at least 200 instructions and probably more with all the mode loops.
+----
+plan: -allocate temp result array for the first gemm test, see that it gets assigned, and check result by
+back to cpu. -extend to other blas cases -think about general partial fixed case kernel (fixed is looping over
+same instead of independent indices, mult is always a given anyway. contract indices are also shared instead of indep
+but also summed over not mem location)
+------
+
+ok so a slight problem: operands are pushed around on the stack for the pairwise constractions.
+that implies memory allocation for intermediate results. compared to n^3 a copy of data is not a big
+deal, even on gpu on torch I do mem alloc implicitly on all the tensor functions. since I don't 
+know which product gets produced first, I cannot prealloc this.
+allocating on gpu should not be a big deal if no shape etc is set on cpu, but can I prevent this?
+In any case, for now just allocate temp array as before but directly. Since have temp mem anyhow, 
+might as well disallow the preallocated output, so don't have to worry about assignment.
+Make sure to clean up the intermediate memory when popping from stack, and unfortunately somehow 
+have to keep track across calls on the actual output, which would imply a garbage collector, extending
+numpy gc. Damn. There must be some way to gc C malloc wrapped python. This is not just an einsum issue,
+if this is supposed to work for autograd, there must be gc somewhere. well worst case like torch, make
+a gc call, just have to create the dev arrays using api wrapper and some python destructors if they exist. 
+To test speed I have to worry about it as I'll do loop to amortize jit.
+-----
+
+fallback to einsum (can_blas):
+1 cross product
+2 retained indices on both terms
+3 anything with not 2 terms (I guess when he gives up on remaining contractions)
+4 any repeated indices in same term (not sure what that does in einsum)
+
+except for 1 I don't see use case in deep, so 'not supported' message would be fine.
+1 can just be translated into an outer product of two vectors, which at least is feasible as gemm
+Actually I need to be able to diag, ie usv' meaning ij,j,jk. Not sure if opt_eins even does this right.
+one correct split would be to do (ij,j),jk, ie all common indexes fixed.
+ So definitely need to do retained indices 2, for svd diag mult and also for just cmul. 1 cross can be 
+translated into a gemm just like inner product can, with reshape to extra 1-dimensions.
+2 is basically a parallel scan (of two arrays), in that sense as easy as it gets for a kernel, and like
+any unitary element-by-element function. General fixed index case more involved, still looping over the
+other indices, but now the inner is just single multiplication as well as loop for location. Even worse,
+general partial index would be some fixed some sum.
+
+
+
+also he does handle 'dot', all indices same in both terms, inner product. Where does that go in blas,
+this would be a vector dot product (array->vector flattened) which there is blas1
+
+
+finish now: need to call einsum with device array
+implement this by own test wrapper case
+
+also see ~/autograd_project 
