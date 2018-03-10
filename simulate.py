@@ -23,14 +23,23 @@ def rwblock( shape, out, N, divisors ) :
   
   #spillover dimensions
 
-  spillover = np.where( block >= N )[0][0]  #returns a list of arrays, each for one index
-  spillover = np.argmax( block >= N ) #same: the max is '1', and arg returns the first occurrence
-  spilloverOut = np.where( blockOut >= N )[0][0]  #wrt out order
-  #if N is smaller than first dimension, the spillover dim is the first dim, everything works same
+  def calc( block ) :
+    spillover = -1 + np.where( block >= N )[0][0]   #returns a list of arrays, each for one index
+    spillover = -1 + np.argmax( block >= N )  #same: the max is '1', and arg returns the first occurrence
+    #everything still works out if first dim is spillover dim
 
-  #so now the tensor should be block padded to a divisor of N, at the block P next to spillover.
-  p = spillover-1  #to get the next smaller block not spilling over 
-  padded = divisors[ np.argmax( divisors >= block[p] ) ]
-  padding = padded - block[p]
+    #so now the tensor should be block padded to a divisor of N, at the block P next to spillover.
+    def Padding( p ) :  #block size to the left of dim p 
+      padded = divisors[ np.argmax( divisors >= block[p] ) ]  #first divisor as big as block to left of p
+      return padded - block[p]
+    padding    = Padding( spillover )
 
-  return padding, padded, p 
+    #finally, size of spillover interval
+    paddedBlock = padding + block[spillover]
+    interval =  N / paddedBlock
+    return spillover, padding, paddedBlock, interval
+
+  return calc(block), calc(blockOut)
+
+
+
