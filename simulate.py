@@ -5,17 +5,19 @@
 
 import numpy as np
 
-def rwblock( shape, out, N, divisors ) :
+def rwblock( shape, out, N, divisors, block=None ) :
   assert(divisors[0] == 1)  #need 1 in case first dim is spillover dim
   #calculate all block sizes
 
   D = len(shape)
   #block[i] indicates size of the block to the left of dimension i
-  block, blockOut = np.zeros(D, dtype=int), np.zeros(D, dtype=int)
-  block[0] = 1.0
-  for i in range(1,D) :
-    block[i] = shape[i-1] * block[i-1]
+  if block is None :
+    block = np.zeros(D, dtype=int)
+    block[0] = 1.0
+    for i in range(1,D) :
+      block[i] = shape[i-1] * block[i-1]
 
+  blockOut = np.zeros(D, dtype=int)
   blockOut[0] = 1.0
   for i in range(1,D) :
     blockOut[i] = shape[out[i-1]] * blockOut[i-1]
@@ -96,24 +98,67 @@ def bank_padding( a, b, out, bankN ) :
       assert( padding >= 0 )  #never trust % 
  
       #adjust the current and downstream read order blocks to the new padded sizes
-      ob = paddedBlock[r]
-      for i in range(r,D) : paddedBlock[i] = paddedBlock[i] * (ob+padding) / ob
+      expand_block( paddedBlock, padding, r )
+#      ob = paddedBlock[r]
+#      for i in range(r,D) : paddedBlock[i] = paddedBlock[i] * (ob+padding) / ob
 
   return paddedBlock 
+
+def expand_block( block, padding, where ) :
+      ob = block[where]
+      for i in range(where,len(block)) : block[i] = block[i] * (ob+padding) / ob
 
 #Can validate now that sm write block is contiguous wrt bankN %, by iterating through any write block in write order.
 #For that I need C) map
 
-def map_write( s, a, b ) :
+def map_write( s, a, b, out, paddedBlock ) :
   #get scalar sm entry corresponding to all indices 
 
   #split s into write block indices, given fixed read-only dimensions of the rw block
    
   #split s into write block indices
+#  from pdb import set_trace; set_trace()
   index = np.zeros(b.spillover+1, dtype=int)
   r = s
-  for i in range( b.spillover, -1, -1 ) : 
-    index[i] = r / b.block[i] 
+  for i in range(b.spillover, -1, -1) :
+    index[i] = r / b.block[i]
     r = r % b.block[i]
 
+  #sm scalar entry  (leaving read only indexes at 0 for now)
+  sm = 0
+  for i in range(b.spillover+1):
+    sm = sm + paddedBlock[out[i]] * index[i]
+
+  return sm 
+
+
+def map_read( s, a, b, out, paddedBlock ) :
+  index = np.zeros(a.spillover+1, dtype=int)
+  r = s
+  for i in range(a.spillover, -1, -1) : 
+    index[i] = r / a.block[i]
+    r = r % a.block[i]
+
+  #sm scalar entry  (leaving read only indexes at 0 for now)
+  sm = 0
+  for i in range(a.spillover+1):
+    sm = sm + paddedBlock[i] * index[i]
+
+  return sm
+
+
+
+
+
+
+def test_bank( N, bankN, a, b, out, paddedBlock ) :
+  print( ('write sm % bankN', 'sm'))
+  for s in range(N):  #actually this could be multiple of N. !
+    sm = map_write( s, a, b, out, paddedBlock )
+    print( sm % bankN, sm ) 
+
+  print( ('read sm % bankN', 'sm'))
+  for s in range(N):  
+    sm = map_read( s, a, b, out, paddedBlock )
+    print( sm % bankN, sm ) 
 
