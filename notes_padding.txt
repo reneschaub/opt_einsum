@@ -1,0 +1,322 @@
+ok option:
+
+difference between my approach and his: full blocks obviously is the 'trivial' case,
+where you have two blocks that are relocated on outer rim, which is same as tiling approach,
+where you do orthogonal write and bank +1 padding of inner. And tile of course means each
+block is split in aligned lines of 32 say bytes. Actually no because the two blocks won't just be 
+transposed as a unit but rather within order can change. So he is actually sucking in the whole blocks
+in a single thread block (instead of a warp tile). A thread block can have shared memory, so only point
+is to use it all.
+* don't understand what I meant there *
+There are 32 banks. There is a number of contiguous read dimensions to exploit 32, and of all the
+write contigous dimensions, there is one that's most to the right of the read dimensions. If it cuts
+into the inner read block, then presumably the remaining read dimensions do not make up 32 banks.
+(lets say the innermost read dim is skinny and shifted somewhere else as the whole permutation)
+* case when (a,b) -> (b,a) with b < 32 and a >> b
+
+Can you prevent bank conflicts on both read and write, at all, for
+(A:2,B:16,C:2) -> (C,A,B)   ?
+If I pad C from 2 to 32+1, not only would that be wasteful, there would be write shared mem bank 
+conflicts. If I pad 32+2, no write conflicts, but of course the orth reads are fucked again.
+
+You'd have to read multiple lines (/32 threads) into registers, and then compile multiple output 32 
+lines to write consecutively to global, ie involving the C dimension.
+** ie do the orth by register (=no conflicts), while reading into regs in global read order *
+
+Basically the lines have to be read in same order they were written to sm, again, but not by the same
+threads. the threads can be in any order. if same order, only 16 threads would have the two rows making
+one whole new row. But you need 32 threads to write the whole word. So either they shift one of the reads
+to the next thread, or the read order for the second line is swapped for odd and even threads, involving a diverging if. Either way is probably as fast, but can only do one in numba.
+** line := 32 bytes of consecutive mem. Read multiple lines in global read order, but so that 32 threads have 
+corresponding info for a whole global write line: either nvidia 'shift' bytes from odd to even threads,
+or if statement on 2nd line so odd threads read even mem and vice versa. ** 
+
+Since this is only used for contraction gemms, I have at least one more option, which is moving the 
+out block to the other side. That means the skinny dimension won't change, and instead of hinder it will
+only help, slightly.
+** unless global inner read dim is part of inner write, by moving out block all the way to the left,
+the dim stays in place and so helps with the orth process.
+
+ So the out block not only overlaps the in block, but all to the right. lets say
+(A,B,C,D) -> (B,C,A,D). Assuming no skinny problems, how does the banks look now? Well if D > 32,
+orthogonal placement does not affect D reads or writes. It will be tiled the same way. Otherwise, C and A
+can be tiled plainly, assuming the shared m block is (A,C,D). If it is (A,B,C,D), then the +1 buffer has
+to be at B, so that counting  up A shifts the B,C,D blocks to the right wrt banks.
+Counting starts with the innermost write dim F wrt read, whether or not another write dim is sandwitched even 
+closer. But if it is sandwitched, then at every run through all of F, that dim is increased, so it is going
+to add one subblock, but is still in the same overall +1 block, so the relative offset only depends
+on the +1,..blocks defined after F. Hey, it still works then. So the rule is:
+
+Innermost write dim F's block M on the right wrt read dims is the block that gets the +1s, then consecutive F
+values have consecutively shifted banks. 
+** clear enough. Even if there are other write dims in the M block. Note: 32 pad + 1  **
+** wait i think there is a problem at with other dims of the write block, but lets wait I may get there below **
+
+That remains true when counting up to the second write dim if that dim G is outside M,
+** !not really, if gap between, throws it off **
+ but when it is inside
+M, it is off: F resets to original block, it would have to be shifted by F, and also M adds an offset.
+Actually even if M is outside but not adjacent to F in read order, the offset will be as many interceding 
+dimensions as there are so it's no good there. Well I should be able to handle that by
+padding the last interceding dim block: it doesn't affect the F block padding. Lets say the interceding dim I
+vol is 8, that just means for every M count there are F*I +1 shifts, while I want F shifts. Just have to cycle 
+through the banks, so F*I % 32 + X = F, so use that X % 32 to get a positive number, that's the padding.
+For the sandwitch case: it will shift by the subblock size S, total shift is S % 32, and I want shift = F.
+I can padd the S block to get F; all I have to do now is to recompute the F right block padding to give +1.
+The trick is to start padding with the innermost write dim relative to the read block, and depending on 
+position wrt to F dim, do one of the two. Now unfortunately the picture isn't 100% complete, because there
+can be multiple dims sandwitched or outer. So for outer, we want the shift to be the current inner write count
+volume, and for sandwiched, the same, but including F, and all the dims that are counted up before the current
+sandwiched one.
+*** the sm block in write order (mnopDACB) gives the needed bank padding: starting with innermost write dim B,
+each increment needs a bank shift +1, then each increment of C needs a shift of + 1 and the total inner B dim
+shift, ie B+1, next incrementing A needs CB+1 etc.  The actual padding is calculated in read order of the
+inner write block dimensions, eg AmBnCoDp, where say oDp is the inner read block. D needs a ACB+1 shift,
+so pad p block accordingly. C needs a B+1 shift, so pad oDp accordingly. B needs a +1 shift, pad nCoDp to 32+1 ***
+>>>> implement this for arbitrary shape and permutation, then count up inner write block DACB in order and 
+output all modulo 32 scalar positions in the sm block to see that they are consecutive <<<<n<
+
+** virtual: I can pad the inner read and write blocks so they are divisible by 32. Padding any dimension with
+0 is ok for gemm. Padding both with overlap is only a problem when same outer dim, then just go down until
+dims are separate and then pad those to the minimal common size or 32, and pad the shared border dim after that.This is critical to keep global rw aligned on 32 boundaries otherwise need 2 global access for every warp. **
+**basically I'm at tiling now. You can't just subblock arbitrary dimensions into single 64 word pieces without
+padding every dimension as a multiple of 2, which has exponential wasteage. Whatever cube the 64 spills into 
+has to be split, but can't along nice subblock boundaries **
+** the algo is simply: determine block that 64 spills into. Split that block into linear pieces of multiples
+of 64, so that together with the similarly split write block, we get the combined rw block (full blocks
+may be too large.) Now the problem is: I can't transpose it when the dimensions are not complete or even aligned
+ on any dimension. The tiling approach only works when the block contains independent dimension ranges. 
+
+****My algo only works with padded input/output tensors, but then it works without restrictions of block sizes,
+and wasteage is bounded: Pad 'spillover' inner read and inner write cubes (largest contig cubes < 64) to 
+divisor of 64 (16,32,64,128), so that the 64 (*amort if too much overlap) is a multiple of the spillover block,
+therefore have full independent contig ranges that can be transposed.
+ Apply the funky bank padding, same as before (worst case use padded tensor 0s), and transpose again contiguously writing 64 blocks to global.
+ Precalc sounds simpler than cascading, I'm not sure it is even smooth anymore on those 64 pieces (>>check).
+ >>Check if he does proper bank padding on the full blocks, and other dim is single dim. Single dim is the 
+ huge drawback.
+ >>write simulation with spooling out the reads and writes as counting loops (-> each +1 building new indices)
+  where by default the global reads and writes are contiguous, but have to validate that a) the 
+  shared mem write positions are contiguous as well b) the shared mem read positions are mod 32 unique.
+   Functions: A) global scalar of interval block -> sm interval block dims + padding; B) r,w cont block dims(intervals),
+   in order, out order -> bank padding; C) global write scalar -> sm interval dims + padding; D) determine r/w blocks 
+  
+  D) the spillover and padded gcd tensor assumption, trivial other than shared: if outer, just do gcd. If inner spill,
+  no issue. First, determine out tensor default gcd padding (write order). Even if same dims get the padding, they 
+  can be different (global write padding can change): the point is we have the whole (interval) dimension rw block.
+  So this is really easy.
+  B) my awesome algo clear rules
+  A) do the plain modulo counts or direct sum to get indices, strides + block pads (all given, completely straightf)
+  C) same as a but different index values
+  Do this all in numpy
+****
+>>>>Now why is first dim of sm padded
+For one I'm not accounting for the spill interval properly: I use the dim size instead of the interval.
+E.g. regular transpose with large dims would have spillover dim 0 each, and not be affected but clearly it is:
+for tile intervals a,b, for each b increase you want +1 (left block) increase in %32, so a+x = 1 %32. Since a is interval
+so 32 multiple, x = 1, so the usual +1 shift in sm. 
+So what's missing. The write dimension has a block to the left in read order which needs to be padded.
+In my loop, going over all read dimensions, the second is a write <= spillover dim. So everything is fine, except
+I need to use interval blocks not original blocks.
+
+So when will my worst case scenario happen, e.g. padding the first dimension from 1 to 9 (10x waste), does it make sense.
+Basically it is because of the write block desired skip (9) instead of 1, with a block to the left of the write dim,
+instead of the innermost dimension (happens with every write block except first), but only if that write dimension
+is the first read dimension, and part of the inner write block (so here it pays to keep those blocks small).
+So again in a,b interval block: a is second write dimension, but doesn't care about pad because it's not in inner write block
+(and even if it was, both are %32==0 so would mean no padding. No actually need ==1, so padding is 32x). 
+b is first write dimension (needing +1), second read dim with a block to left, so a needs to be padded to %32==1
+ So with all but the first inner write dims, none better be the first read dim, unless the left write block is %32==1
+Well couldn't that be helped by padding the output write block? Yes but then won't be aligned to 32 global, so double
+the writes. Since 1 global write ~ 10 sm accesses, and probably less than 10 ops per global access, doubling global will 
+be the bottleneck (but still not terrible, esp since can have the option of not padding in/out tensors in the first place) 
+ So probably just bite the bullet: having shared first read dim seems rare, if so it reduces total sm block 
+to  64*64/shared dim, then the extra up to 32 factor is much less, unless it's a tiny dim. so at worst 10x.
+64*64 is 16KB, and 128*128 already 64K which is the limit of shared mem I think. So the 10x already busts it.
+ >>what if the first read dim tiles, but is also the spillover dim for the write? This is handled as a regular case,
+blowing up the write cube to have same interval. It really could blow out to 500K (64*64*32*4)
+>>run some random cases to see how often it goes above available mem. If only shitty tensors, can eat the bullet of 
+bank conflicts, which is at most a 32x extra operations per global read, so maybe a up to 3x slowdown. Which may not 
+be too horrible vs. matrix. It also means the whole left block of that fucking dimension (wrt write) is bank 
+contiguous, and the next will just overlap it somewhere (at worst complete overlap, but could calculate that too and
+do partial padding.
+
+TODO: fix the interval block (not block). check read order. write sm size check, with opt out of padding beyond that cube.
+the write sm check is bad too: if I pad 32, then all sm writes are on same bank. Another reason not to.
+>>If I pad the tensor dimensions to powers of 2, I waste a lot of mem but that's ok with these stupid small tensors
+that don't tile (sm is limited, not global). Check what happens in those cases with the bank padding. (but not only is
+space wasted, this linearly increases the time for global reads)
+>>Wait, the 32 banks cannot be valid for all cores in SM, otherwise only one warp could read sm at a time. So within
+a warp, have to spread to 32? maybe that's how it is, just one warp gets to sm at a time, so latency 2, or maybe it is
+pipelined.
+>>basically I don't want to pad any read block < 16. Everything else damage is limited (both read order and sm size) 
+>>>implement the interval dim block already, so can do proper testing 
+
+
+property independent of permutation)
+
+
+So why do I need virt dims again? For the same reason that he splits up a dim, to distribute it across blocks
+if it is too large. But my direct reason was to have full dim inner and outer blocks, which are used to 
+calculate the grid, not the orig dimensions (the padding does not affect the grid) 
+ Precalculating the read and write positions is feasible because for every thread block, the position 
+sequences are the same, per thread. But that's 2 more global arrays that need to be read into registers,
+in addition to the actual shared mem. I think there are 250 registers, so that's not too bad, but the
+global mem has to be read across all threads, which is 2x as much info as the actual memory moved, though
+that is read and written, so only 1x. Now since it is always the same across blocks, and not that much,
+it would seem that can be kept in L1 cache always, so essentially no extra effort. Since it is array,
+could even do this in numba (well p should also be cached as even the same across threads).
+Precomputing would be much easier than reverse cascading. But I need 4 arrays: read global positions, 
+write shared positions, read shared position, write global positions. Still not a problem, because
+can do small loop < 32, say 8, *4 = 32. even 32 would be 128 should still be ok. Only downside is I can't
+amortize the block calculations, so have to do his shifting thing which I can't with numba.
+
+Lets see how reverse cascading would work. The inner block is constant, with each thread having a number.
+The j loop on outer block is over the remaining dimensions. Preferably I want only a +1. That would
+be more or less the case for the shared storage (but the bank paddings), but global read can have interdims.
+Also note that the outer loop is the same for all threads, just like the global block address.
+So technically could also do a reduction for every loop element, but in contrast to global block, there should
+only be few dims in the outer read. But it means there is no thread divergence at least, for any
+reverse cascading. So what is it? a counter on the F dimension; check each iteration if == F, then
+go on another path where you do all the adjustments up to last dim if necessary. On average it's O(1).
+Cutting the path short is not a problem as all threads will do the same.
+So each fast step involves:
+-counter +1
+-test
+-add block size to previous address.
+-global read and shared write.
+Could also drop counter and test / block the prev. address and if F-1, there you go. But that adds
+a division op, so no, keep the counter which is a fast op. The test and counter should be very fast,
+with only one real arithmetic op adding block to address.
+The complexity is similar to the plain loop, just with gating ifs and using previous address.
+
+With reverse cascading, I'm removing the biggest overhead per global mem, still leaving the bank conflicts,
+which now should be the biggest overhead, after I remove all the junk and move p to registers (but 
+wait first, maybe that is cached and/or even registered. At least mark the local arrays 'local' so compiler
+can even decide to move to register (if I always only loop through them in a for loop).
+The global block position can be amortized for now.
+
+But what's the chain: 
+get current virtual indices (sh mem) -> get current real indices (g mem) 
+-> bounds check -> shared and real scalar positions
+ 
+the reverse cascade would start at virt indices, even though if I only have say a 2 dim outer loop,
+it may not be any faster. The whole chain needs to be collapsed. The impact of a +1 on the real indices
+is also +1, and the current real index is same as last one. If the first dim is split, it's still just +1,
+only the second virtual blocks have impact. I also don't have to worry too much about register use,
+because the register pointing to current index only changes at log steps. But stil.
+So just +1 the real index, and do check on the virt +1 counter.
+Bound check can be done now, I'm guessing not needed for innermost so only in cascade.
+The scalar position are the sum of the indexes with strides, which I have already done by the +1 
+ops. The other dims are adding as well, just on larger blocks, using same register to hold 
+the address (shared and global)
+
+Damn reversing up the splits is a pain: it could be very well that the first outer is a left split,
+which would be the case when that dim is both in read and write inner, and if it is not split in write
+(if it is, no better).
+Either way it is or isn't, just preset block size increment accordingly (ie block size multiplied by the split dim)
+I should do that in the first place: just set the stride dimensions for the real calculation differently
+but still using vix, instead of checking the split type each time (outside prep). I must maintain
+counters for the combined real indexes though, in addition to the virtual counters. I guess I can 
+do that because there are only 2, so just need to find each cascade up which one is impacted and by how much.
+ The difference is just that the real block strides are different from the virtual ones.
+For the real counter check, just set one array for each split, by how much the current index increases that 
+counter (ie most have 0), then can just for loop through cascade, without having to check each index twice.
+ As a matter of fact, I don't have to check at all for the read loop, it will just write garbage into the
+unused shared memory. But I definitely need it in the write loop.
+ Instead of a virtual longer coverage block, I could also do a virtual shorter block, skipping the border,
+then I would never have to check real indices. The missing stripe simply uses fewer contiguous threads,
+and it's a well defined subblock with two narrow left split dimensions. The problem is if I change the number
+of threads, how will it do warps??
+
+>>>What happens to Warps if T <> x*32?? I can't force T to be 32 if the dimensions dont want to, esp it happens
+on both read and write, different T. If I have to do 32, I have to virtualize all the dimensions up to a split,
+and check all of them in every write.
+
+
+
+
+
+ 
+
+
+This would be annoying as fuck and I don't even know how to generalize it. 
+
+Technically using local arrays should put them in registers for simple unrollable loops.
+
+
+
+
+
+
+
+-------------------- more detailed rambling
+#implement and test padding algorithm given shape, arbitrary permutation, and bank size
+
+#how to simulate: calculate padded dimensions in sm order
+
+#wait what do I do with the virtual block padding: I extend the left split dimension so s = lr > d  is 
+#a multiple of r. BUT I have reduced T to exactly fit the right split block, not 32.
+#And T here isn't actually the number of concurrent threads, but rather the coalescing word size,
+#which is 32. After a 32 word has been retrieved, a jump is ok (aligned on 32).
+#so you lose at most one 32 mem access, vs total number of threads available, you just read as many
+#32 blocks until no more threads (so last one will be partial). Actually first and last will not be aligned,
+#because dims are arbitrary. For gemm I can only pad the leftmost dim a priori.
+
+#!!Wait I forgot: every dimension can be padded with 0: gemm still works as just contracting same 0s on all dims. Don't even need gemm stride vs dim option.
+#so can assume every inner cuber is a multiple of 32.
+#> if the blocks don't have the same leftmost dimension, they can be padded independently/one after the other.
+#(do the order with the better result). If shared, I guess take it to the virtual dimensions <<check
+#well a simple example is rw block CAB and CBA, both fitting just below T (say 64), but then they also have
+#the same padding. So say CA and CB where B = A-1: ha, I have to padd B so it's equal to A. So basically
+#go down the block until the block boundaries are different dimensions then equalize them with least padding 
+#needed, and apply the main 32 padding on the shared dim.
+
+#This doesn't quite solve the virtual block problem. Say BA is padded to 32 mod, but B may be huge and A tiny,
+#say 1000 and 3. So 32 doesn't even fit on a virtual block. Ignoring it means I have to extend the 
+#read block to all of BA, then I get a proper block, but no distinction between inner/outer. But there 
+#isn't a real need to create a block for each thread block. Actually a fake block is created in that I could
+#have ab = AB but with b=32, a = AB/32, with completely different dimensions, but purely linear application
+#so it doesn't matter.
+# The writing to SM involves padding, but the real issue is finding demarcation along the original dimensions.
+#But that is actually a problem even for the plain bank padding algo: If I'm going to spread threads of
+#32 multiples straddling dimensions, I still have to calculate the SM position using the proper
+#SM index resolutions of the corresponding scalar position, and then apply the bank strides to find the SM
+#scalar position to write to. So if 32 aligned reads gets any padding inserted, then clearly there will be 
+#bank conflicts of the two oeverlapping pieces, and 2 accesses required. 
+# The good news it's only 2, not 32 of the same bank. That's actually not too shabby, and only on the write SM.
+#Then the second part is reading the padded sm stuff in 32 blocks like before, in linear global write order,
+#that is, the write block is split into 32 length segments (it is aligned), then just have to figure out 
+#the proper sm addresses which will actually NOT have bank conflicts by design.
+# (the write SM might have more than 2 bank conflicts when there are multiple paddings in a single 32 stretch, 
+#but lets call that unlikely)
+
+#Now if I have relied on the cascading anywhere on each thread having same calc, I'm screwed.
+#The paper capitalizes on contracting the identical global positions per thread block,
+#and that all thread blocks share the same inner sequence of reads so can be precomputed (local + global address). That is also true for my original inner and outer blocks, so instead of cascading I could just precalculate 
+#the positions brute force too. this might be preferable since I don't know how much more complicated 
+#the cascade gets with the paddings and linear 32 blocks.
+
+#But back to virtual: do I still need it? Assuming the tensors are already globally padded out to 32 
+#alignment, at least for blocks of dimensions, I can also pad the global write accordingly, as long
+#as I know the real dimensions too. Lets just say that each contiguous block dim is aligned with 32.
+#So the only thing that can happen is that the multiple of 32 parallel threads lands somewhere in a dimension
+#(but with a full subblock). Then a certain number of tiling is required to cover teh whole dimension,
+#with the last one partial (could actually just padd that dim with the multiple eg 64, then I don't need 
+#the test). Really the padding tensor only needs to observe the global read order anyhow; once it's read, 
+#it can #go anywhere in SM and any padding out global. So it's independent of the permutation.
+#So we always get perfect tiling, but not inner bllocks, because consecutive 64s may be anywhere on the subblock, not nicely spanning whole lower dims. If they were spanning, I could divide the tiles into inner and outer
+#blocks without needing virtual checks, but there isn't much of an advantage of getting the two blocks vs one,
+#except that the indexes corresponding to the inner block don't change.
+
+#so why not pad every dimension as a power of 2: each time, you waste up to 50% of the block. unfortunately
+#that is exponential wastage, not sum of 2. But wait. a
+
+#tiling works when the subblocks have independent dimension ranges, and the innter part is contiguous, ie
+#full ranges for inner dimensions. That's fine because you would only add dimensions if inner is not enough.
+#So lets say we add that final dimension where the cutoff is. The problem is can't align it onto 64 blocks,
+#unless the full block is padded as a divisor of 64 = 2^8. So I can pad the full block to 16, 32, 64, 128
+#(up to 50% waste). If I do that, then the split dim splits into index ranges which can be transposed. 
+
+
+ 
