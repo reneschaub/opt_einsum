@@ -15,11 +15,11 @@ out = (2,0,1,3)
 
 
 
-a,b = simulate.rwblock(shape, out, N, divisors) 
+a,b, c = simulate.rwblock(shape, out, N, divisors) 
 #now pad the tensor; that means need to pass the block as well
 simulate.expand_block( a.block, a.padding, a.spillover )
-a,b = simulate.rwblock(shape, out, N, divisors, a.block) 
+a,b, c = simulate.rwblock(shape, out, N, divisors, a.block) 
 
-padded_block = simulate.bank_padding(a, b, out, bankN)
+padded_block = simulate.bank_padding(a, b, c, out, bankN)
 
 simulate.test_bank(N, bankN, a, b, out, padded_block)

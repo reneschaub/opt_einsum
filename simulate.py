@@ -4,10 +4,12 @@
 #divisors of N in increasing order
 
 import numpy as np
+class struct : pass
 
 def rwblock( shape, out, N, divisors, block=None ) :
   assert(divisors[0] == 1)  #need 1 in case first dim is spillover dim
   #calculate all block sizes
+
 
   D = len(shape)
   #block[i] indicates size of the block to the left of dimension i
@@ -25,7 +27,6 @@ def rwblock( shape, out, N, divisors, block=None ) :
   #spillover dimensions
 
   def calc( block ) :
-    class struct : pass
     r = struct()
 
 
@@ -50,16 +51,65 @@ def rwblock( shape, out, N, divisors, block=None ) :
 
   a, b = calc(block), calc(blockOut)
 
-  #but if spillover dimensions are the same, need gcd for interval (always possible when N is power of two)
-  if a.spillover == out[b.spillover] :
-    assert( a.interval % b.interval == 0  or  b.interval % a.interval == 0 ) #require power of 2, one is divisor of the other
-    a.interval, b.interval = max(a.interval, b.interval), max(a.interval, b.interval)
-    #now one interval block may be a multiple of N. The size is interval * block(spillover) 
-
-  return a, b
+  #If spillover dimensions are the same, need gcd for interval (always possible when N is power of two).
+  #This requires an extra loop over at least one of the blocks, to iterate over the 
+  #multiple of N, in addition to the complementary outer loop.
+  # If a spillover dimension is a shared non-spillover dimension in the other block, the interval is the 
+  #full dimension and the extra loop last iteration is partial because the spillover won't divide the dim. 
 
 
-def bank_padding( a, b, out, bankN ) :
+#  if a.spillover == out[b.spillover] :
+#    assert( a.interval % b.interval == 0  or  b.interval % a.interval == 0 ) #require power of 2, one is divisor of the other
+#    a.interval, b.interval = max(a.interval, b.interval), max(a.interval, b.interval)
+#    #now one interval block may be a multiple of N. The size is interval * block(spillover) 
+
+  # Instead of gcd above could also just do partial loop on the smaller spillover. Actually this is simpler
+  #and I can just keep the intervals as is.
+  rout = reverse_permutation( out )
+  if rout[a.spillover] <=     b.spillover  and a.interval < b.interval :  #a spillover shared, and a needs loop
+    pass
+  if      a.spillover  >= out[b.spillover] and a.interval > b.interval :  #b spillover shared, and b needs loop
+    pass
+
+  c = struct()
+  combined = np.zeros( D, dtype=int )
+  z = 0
+  #indices of combined read write block, wrt original indices, ordered small to large. Noting the positions of the spillover dims.
+  for i in range(D) :
+    if i <= a.spillover  or  rout[i] <= b.spillover :
+      combined[z] = i
+      #where in combined array are the spillover dims
+      if i       == a.spillover : c.a_spillover = z  
+      if rout[i] == b.spillover : c.b_spillover = z
+      z = z + 1 
+  c.indices = combined[:z]
+
+  #the final shape of combined rw
+  c.shape = np.zeros( z, dtype=int )
+  for i in range(z) : c.shape[i] = shape[c.indices[i]]
+  if rout[a.spillover] == b.spillover :
+    if    a.interval <  b.interval :
+      c.shape[ c_a_spillover ] = b.interval;  
+      a.loop, b.loop = true, false
+    elif  a.interval >  b.interval :
+      c.shape[ c.a_spillover ] = a.interval;  
+      a.loop, b.loop = false, true 
+    else : #==
+      c.shape[ c.a_spillover ] = a.interval;  
+      a.loop, b.loop = false, false
+  #now forward expand the block sizes
+  c.block = np.zeros( z, dtype=int )
+  c.block[0] = 1.0
+  for i in range(1,z) :
+    c.block[i] = c.shape[i-1] * c.block[i-1]
+
+
+  #the respective blocks are a.block up to a.spillover dim, with dim size a.interval.
+  #To simulate, 
+  return a, b,  c 
+
+
+def bank_padding( a, b, c, out, bankN ) :
   #The write interval block in global write order gives the needed result of padding: e.g. ABCD, A needs +1 bank modulo shift for 
   #each increment, each increment of B needs A+1 shift, each increment of C needs AB+1 shift, etc.
   # Padding is only needed for the write interval block, which is a multiple of N.  
@@ -77,14 +127,14 @@ def bank_padding( a, b, out, bankN ) :
   #whether or not they are aligned follows from the wrblock() padding number (assuming I run that twice, once on unpadded then padded tensor). 
   D = len(a.block)
 
-  rout = np.zeros(D, dtype=int)
-  for i in range(D) : rout[out[i]] = i
+  rout = reverse_permutation( out ) 
 
   paddedBlock = np.zeros(D, dtype=int)
   for i in range(D) : paddedBlock[i] = a.block[i]
  
 #  from pdb import set_trace; set_trace()
- 
+
+  #>>>REDO THIS: loop over combined indices, nor all read indices (gpu block indices are not part here) 
   for r in range(D) : #i is global read dimension
     w = rout[r] 
     if w <= b.spillover :  #r is a write block dimension
@@ -147,8 +197,10 @@ def map_read( s, a, b, out, paddedBlock ) :
   return sm
 
 
-
-
+def reverse_permutation( p ) :
+  rp = np.zeros(len(p), dtype=int)
+  for i in range(len(p)) : rp[p[i]] = i
+  return rp
 
 
 def test_bank( N, bankN, a, b, out, paddedBlock ) :
