@@ -11,9 +11,6 @@ is to use it all.
 There are 32 banks. There is a number of contiguous read dimensions to exploit 32, and of all the
 write contigous dimensions, there is one that's most to the right of the read dimensions. If it cuts
 into the inner read block, then presumably the remaining read dimensions do not make up 32 banks.
-(lets say the innermost read dim is skinny and shifted somewhere else as the whole permutation)
-* case when (a,b) -> (b,a) with b < 32 and a >> b
-
 Can you prevent bank conflicts on both read and write, at all, for
 (A:2,B:16,C:2) -> (C,A,B)   ?
 If I pad C from 2 to 32+1, not only would that be wasteful, there would be write shared mem bank 
@@ -151,9 +148,16 @@ a warp, have to spread to 32? maybe that's how it is, just one warp gets to sm a
 pipelined.
 >>basically I don't want to pad any read block < 16. Everything else damage is limited (both read order and sm size) 
 >>>implement the interval dim block already, so can do proper testing 
-
-
+>>>>stupid rwblock again: special cases if spillover is a shared dim. now common multiplier doesn't work, would have to pad inner
+to N (64) instead of a a divisor, incurring too large mem losses.
+ Well the threads only have to be 32 contiguous, not 64, for global coalesced, so padding to 32 would be enough but that's still too much
+for small inner dims. Ok, then fucking don't align (2 global accesses) when spillover dim is shared with inner dim, just keep the blocks whole.
+So the read block is now not a multiple of N anymore. Which I haven't really addressed how to iterate even in normal case. Thread blocks are N,
+so the spillover dim is special in that I need to keep the spillover size. So I have a proper block aligning with 64, and during read phase
+I loop not only on write dims but also on the spillover dim. In write phase, that spillover loop is gone as the write has it's own unaltered spillover,
+which may be distributed across thread blocks (or different inner loop if spillovers dims are same).
 property independent of permutation)
+ Never mind just add second inner loop for (partial) multiples of N on the spillover dimension.
 
 
 So why do I need virt dims again? For the same reason that he splits up a dim, to distribute it across blocks

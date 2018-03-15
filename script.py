@@ -22,4 +22,5 @@ a,b, c = simulate.rwblock(shape, out, N, divisors, a.block)
 
 padded_block = simulate.bank_padding(a, b, c, out, bankN)
 
-simulate.test_bank(N, bankN, a, b, out, padded_block)
+simulate.test_bank(N, bankN, a, b, c, out, padded_block)
+print(padded_block)

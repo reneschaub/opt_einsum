@@ -126,31 +126,37 @@ def bank_padding( a, b, c, out, bankN ) :
   #at the intended zero padding addresses, while using the true block strides. Simply means 2 accesses per global read.
   #whether or not they are aligned follows from the wrblock() padding number (assuming I run that twice, once on unpadded then padded tensor). 
   D = len(a.block)
+  z = len(c.indices)
 
   rout = reverse_permutation( out ) 
 
-  paddedBlock = np.zeros(D, dtype=int)
-  for i in range(D) : paddedBlock[i] = a.block[i]
+#  paddedBlock = np.zeros(D, dtype=int)
+  paddedBlock = np.zeros(z, dtype=int)
+#  for i in range(D) : paddedBlock[i] = a.block[i]
+  for i in range(z) : paddedBlock[i] = c.block[i]
  
 #  from pdb import set_trace; set_trace()
 
-  #>>>REDO THIS: loop over combined indices, nor all read indices (gpu block indices are not part here) 
-  for r in range(D) : #i is global read dimension
+#  for r in range(D) : #i is global read dimension
+  for i,r in enumerate(c.indices) : #i is global read dimension
     w = rout[r] 
     if w <= b.spillover :  #r is a write block dimension
 
       #pad read order block to the left of r, paddedBlock[r], so result is b.block[w] shift
-      # need  b.block[w]  % bankN  ==  (padded)a.block[r] + x % bankN 
-      padding = (b.block[w] - paddedBlock[r])  %  bankN   # % precedence is high
+#      # need  b.block[w]  % bankN  ==  (padded)a.block[r] + x % bankN 
+      # need  b.block[w]  % bankN  ==  (padded)c.block[r] + x % bankN 
+#      padding = (b.block[w] - paddedBlock[r])  %  bankN   # % precedence is high
+      padding = (b.block[w] - paddedBlock[i])  %  bankN   # % precedence is high
     
       if padding < 0 : 
         from pdb import set_trace; set_trace()
       assert( padding >= 0 )  #never trust % 
  
       #adjust the current and downstream read order blocks to the new padded sizes
-      expand_block( paddedBlock, padding, r )
-#      ob = paddedBlock[r]
-#      for i in range(r,D) : paddedBlock[i] = paddedBlock[i] * (ob+padding) / ob
+#      expand_block( paddedBlock, padding, r )
+      expand_block( paddedBlock, padding, i )
+      #ob = paddedBlock[r]
+      #for i in range(r,D) : paddedBlock[i] = paddedBlock[i] * (ob+padding) / ob
 
   return paddedBlock 
 
@@ -161,7 +167,8 @@ def expand_block( block, padding, where ) :
 #Can validate now that sm write block is contiguous wrt bankN %, by iterating through any write block in write order.
 #For that I need C) map
 
-def map_write( s, a, b, out, paddedBlock ) :
+
+def map_write( s, a, b, c, out, paddedBlock ) :
   #get scalar sm entry corresponding to all indices 
 
   #split s into write block indices, given fixed read-only dimensions of the rw block
@@ -176,13 +183,21 @@ def map_write( s, a, b, out, paddedBlock ) :
 
   #sm scalar entry  (leaving read only indexes at 0 for now)
   sm = 0
-  for i in range(b.spillover+1):
-    sm = sm + paddedBlock[out[i]] * index[i]
+#  for i in range(b.spillover+1):
+#    sm = sm + paddedBlock[out[i]] * index[i]
+
+  
+  for ci, i in enumerate(c.indices) :
+    #exhausting: if read order index i (at position ci in combined block and wi in write block) is part of the write block,
+    if i in out[ :b.spillover+1] :
+      wi = np.argmax( i == np.array(out) )  #position in out
+      #add write block index wi as multiple of paddedBlock at position ci 
+      sm = sm + paddedBlock[ci] * index[wi]
 
   return sm 
 
 
-def map_read( s, a, b, out, paddedBlock ) :
+def map_read( s, a, b, c, out, paddedBlock ) :
   index = np.zeros(a.spillover+1, dtype=int)
   r = s
   for i in range(a.spillover, -1, -1) : 
@@ -191,8 +206,14 @@ def map_read( s, a, b, out, paddedBlock ) :
 
   #sm scalar entry  (leaving read only indexes at 0 for now)
   sm = 0
-  for i in range(a.spillover+1):
-    sm = sm + paddedBlock[i] * index[i]
+#  for i in range(a.spillover+1):
+#    sm = sm + paddedBlock[i] * index[i]
+
+  for ci, i in enumerate(c.indices) :
+    #exhausting: if read order index i (at position ci in combined block and i in read block) is part of the read block,
+    if i <= a.spillover : 
+      #add read block index i as multiple of paddedBlock at position ci (even that simplifies as ci == i for read block)
+      sm = sm + paddedBlock[ci] * index[i]
 
   return sm
 
@@ -203,14 +224,14 @@ def reverse_permutation( p ) :
   return rp
 
 
-def test_bank( N, bankN, a, b, out, paddedBlock ) :
+def test_bank( N, bankN, a, b, c, out, paddedBlock ) :
   print( ('write sm % bankN', 'sm'))
   for s in range(N):  #actually this could be multiple of N. !
-    sm = map_write( s, a, b, out, paddedBlock )
+    sm = map_write( s, a, b, c, out, paddedBlock )
     print( sm % bankN, sm ) 
 
   print( ('read sm % bankN', 'sm'))
   for s in range(N):  
-    sm = map_read( s, a, b, out, paddedBlock )
+    sm = map_read( s, a, b, c, out, paddedBlock )
     print( sm % bankN, sm ) 
 
