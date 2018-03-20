@@ -50,6 +50,7 @@ def rwblock( shape, out, N, divisors, block=None ) :
     return r 
 
   a, b = calc(block), calc(blockOut)
+  a.shape_block, b.shape_block = block, blockOut
 
   #If spillover dimensions are the same, need gcd for interval (always possible when N is power of two).
   #This requires an extra loop over at least one of the blocks, to iterate over the 
@@ -90,18 +91,23 @@ def rwblock( shape, out, N, divisors, block=None ) :
   if rout[a.spillover] == b.spillover :
     if    a.interval <  b.interval :
       c.shape[ c_a_spillover ] = b.interval;  
-      a.loop, b.loop = true, false
+      a.loop, b.loop = True, False
     elif  a.interval >  b.interval :
       c.shape[ c.a_spillover ] = a.interval;  
-      a.loop, b.loop = false, true 
+      a.loop, b.loop = False, True 
     else : #==
       c.shape[ c.a_spillover ] = a.interval;  
-      a.loop, b.loop = false, false
+      a.loop, b.loop = False, False
+
+
   #now forward expand the block sizes
-  c.block = np.zeros( z, dtype=int )
-  c.block[0] = 1.0
+  #(this still will be padded later)
+  #(read padding is not carried over here because there is no point: bank memory does not have to be aligned, only 
+  # consecutive) 
+  c.shape_block = np.zeros( z, dtype=int )
+  c.shape_block[0] = 1.0
   for i in range(1,z) :
-    c.block[i] = c.shape[i-1] * c.block[i-1]
+    c.shape_block[i] = c.shape[i-1] * c.shape_block[i-1]
 
 
   #the respective blocks are a.block up to a.spillover dim, with dim size a.interval.
@@ -133,7 +139,7 @@ def bank_padding( a, b, c, out, bankN ) :
 #  paddedBlock = np.zeros(D, dtype=int)
   paddedBlock = np.zeros(z, dtype=int)
 #  for i in range(D) : paddedBlock[i] = a.block[i]
-  for i in range(z) : paddedBlock[i] = c.block[i]
+  for i in range(z) : paddedBlock[i] = c.shape_block[i]
  
 #  from pdb import set_trace; set_trace()
 
@@ -151,14 +157,19 @@ def bank_padding( a, b, c, out, bankN ) :
       if padding < 0 : 
         from pdb import set_trace; set_trace()
       assert( padding >= 0 )  #never trust % 
+      if padding > 0 : print( "padding" + str(padding) )
  
       #adjust the current and downstream read order blocks to the new padded sizes
 #      expand_block( paddedBlock, padding, r )
-      expand_block( paddedBlock, padding, i )
+
+      #on first read dim padding has multiplicative effect: disrupts contiguous sm writes and not enough memory.
+      #If it is also first write dim there is no padding anyhow, so at least the first write dim is write bank contiguous
+      if r != 0 :  
+        expand_block( paddedBlock, padding, i )
       #ob = paddedBlock[r]
       #for i in range(r,D) : paddedBlock[i] = paddedBlock[i] * (ob+padding) / ob
 
-  return paddedBlock 
+  c.block = paddedBlock
 
 def expand_block( block, padding, where ) :
       ob = block[where]
@@ -168,7 +179,7 @@ def expand_block( block, padding, where ) :
 #For that I need C) map
 
 
-def map_write( s, a, b, c, out, paddedBlock ) :
+def map_write( s, a, b, c, out ) :
   #get scalar sm entry corresponding to all indices 
 
   #split s into write block indices, given fixed read-only dimensions of the rw block
@@ -192,12 +203,12 @@ def map_write( s, a, b, c, out, paddedBlock ) :
     if i in out[ :b.spillover+1] :
       wi = np.argmax( i == np.array(out) )  #position in out
       #add write block index wi as multiple of paddedBlock at position ci 
-      sm = sm + paddedBlock[ci] * index[wi]
+      sm = sm + c.block[ci] * index[wi]
 
   return sm 
 
 
-def map_read( s, a, b, c, out, paddedBlock ) :
+def map_read( s, a, b, c, out ) :
   index = np.zeros(a.spillover+1, dtype=int)
   r = s
   for i in range(a.spillover, -1, -1) : 
@@ -213,7 +224,7 @@ def map_read( s, a, b, c, out, paddedBlock ) :
     #exhausting: if read order index i (at position ci in combined block and i in read block) is part of the read block,
     if i <= a.spillover : 
       #add read block index i as multiple of paddedBlock at position ci (even that simplifies as ci == i for read block)
-      sm = sm + paddedBlock[ci] * index[i]
+      sm = sm + c.block[ci] * index[i]
 
   return sm
 
@@ -224,14 +235,77 @@ def reverse_permutation( p ) :
   return rp
 
 
-def test_bank( N, bankN, a, b, c, out, paddedBlock ) :
+def test_bank( N, bankN, a, b, c, out ) :
   print( ('write sm % bankN', 'sm'))
   for s in range(N):  #actually this could be multiple of N. !
-    sm = map_write( s, a, b, c, out, paddedBlock )
+    sm = map_write( s, a, b, c, out )
     print( sm % bankN, sm ) 
 
   print( ('read sm % bankN', 'sm'))
   for s in range(N):  
-    sm = map_read( s, a, b, c, out, paddedBlock )
+    sm = map_read( s, a, b, c, out )
     print( sm % bankN, sm ) 
+
+
+
+def loops( N, bankN, a, b, c, out ) :
+  #according to shape elements, not blocks (skip threads)
+
+  #size of read interval block, the number of threads in thread block that can read (padded or not), not N
+  #(padded only keeps global reads aligned) 
+  TR = a.interval * a.block[a.spillover] 
+
+  #outer scalar is a multiple of that size.
+  #global or local positioning of spillover dimensions have a partial final iteration, for both r and w blocks,
+  #and for both global read and global write. So each loop has two parts, last iteration partial.
+
+  #contiguous scalars in partial iteration
+
+  #count up a d block of global interval indices, like c block, where there is a virtual dimension and block next to the interval dim.
+  #these can be counted up several times, so partial can happen several times. What changes in the partial is TR, the number of active
+  #contiguous threads, that's it. Note there are two partials: to complete the dimension (global block), and to catch up to larger spillover
+  #(read or write block match)
+  #Note on global there are typically two completion loops, one for each spillover.
+  #So each thread block has to know if it is a final completion iteration. So fuck what if both are the final completion 
+  #iteration at the same time. In particular, what is the meaning of the write spillover in the read loop? Well nothing because
+  #there is no completion then <wrong>. You do a completion if read spillover is also a write dim and vice versa, or if they are shared,
+  #and the meaning is TR both times. For global, the question is the meaning of the second completion. It is cutting
+  #down the outer loop of the rw block on the spillover dimension. So that interval dim is shorter depending on global block,
+  #and whether we are in the read or write loop. If a spillover is in other, the dim is not part of global block.
+  # Tricky: when spillover is shared, behavior in global partial, if read spill < write: basically the write spill changes here,
+  #so its changing the inner completion loop dim. But basically can just make all inner spills completion loops: you have a 
+  #spill interval, and you have a dim. when interval > dim, you do a partial TR, and otherwise loop adding interval.
+
+  #the global block counter is always a product of dimensions, so get those first (d) with corresponding blocks 
+
+  #>>>>This is all that's needed:
+  #-d.indices, step (for spillover dims, jump several blocks - no need for new dim), block (read global) for counting the blocks,
+  #as well as block write global 
+  #-a,b each spillover has a completion interval (e.g. whole dim, same as interval, same as larger spill, or somewhere in between if partial block - whether or not its the tricky case)
+  #-global passes down partial as new completion intervals, whichever or both spillovers happen to be partial in the thread block
+
+  #remove all dims in left r or w block. In the remaining dims, set step of spillover dim (largest if same)
+
+  # not(inner b)  and  not(inner a)
+  d = struct()
+  notb = np.array(out)[b.spillover:]
+  d.indices = notb[ np.where(notb >= a.spillover) ]
+  d.indices = np.extract(notb >= a.spillover, notb)
+  d.steps = np.ones(len(d.indices), dtype=int)
+
+  #set steps to spillover if in remaining dims
+  if a.spillover in d.indices :
+    aspi, = np.where( d.indices == a.spillover )  #I don't want to select first index and tuple every time 
+    aspi = list(d.indices).index(a.spillover)
+    if a.spillover  ==  out[b.spillover] :
+      d.steps[aspi] = max( a.interval, b.interval )
+    else :
+      d.steps[aspi] = a.interval 
+  if b.spillover in d.indices  and  a.spillover  !=  out[b.spillover] :  
+    bspi = list(d.indices).index(b.spillover)
+    d.steps[bspi] = b.interval 
+
+
+
+
 
