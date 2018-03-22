@@ -280,7 +280,7 @@ def loops( N, bankN, a, b, c, out ) :
 
   #>>>>This is all that's needed:
   #-d.indices, step (for spillover dims, jump several blocks - no need for new dim), block (read global) for counting the blocks,
-  #as well as block write global 
+  #as well as block write global - that's just from the read and write full blocks then (nothing in sm)
   #-a,b each spillover has a completion interval (e.g. whole dim, same as interval, same as larger spill, or somewhere in between if partial block - whether or not its the tricky case)
   #-global passes down partial as new completion intervals, whichever or both spillovers happen to be partial in the thread block
 
@@ -305,6 +305,64 @@ def loops( N, bankN, a, b, c, out ) :
     bspi = list(d.indices).index(b.spillover)
     d.steps[bspi] = b.interval 
 
+  #size of global block
+  GN = 1
+  for i, ii in enumerate(d.indices) :
+    GN = GN * int(np.ceil( 1.0 * shape[ii] / d.steps[i] ))
+  d.GN = GN
+
+ 
+  def blocken( indices, steps ) :
+    block = np.zeros(len(indices), dtype=int)
+    block[0] = 1
+    for i, ii in enumerate(indices[:-1]) :
+      block[i+1] = block[i] * int(np.ceil( 1.0 * shape[ii] / steps[i] ))
+    return block
+
+  d.block = blocken( d.indices )
+
+  def indexen( s, block ) :
+    index = np.zeros(len(block), dtype=int)
+    r = s
+    for i in reversed(range(len(block))) :
+      index[i] = r / block[i] 
+      r = r % block[i]
+    return index 
+
+  #here the block is supposed to be larger than indices (e.g. full global read block)
+  def scalar( block, indices, index ) :
+    s = 0
+    for i in range(len(indices)) :
+      s = s + block[indices[i]] * index[i]
+    return s 
+
+  #scalar thread block to scalar global read
+  def map_global_read( s ) :
+
+  #*global block only, to break up s, and global read block to get new scalar
+  #*create function that takes shape (or indices) and returns corresponding block 
+  #*create function that takes block and splits up number into corresponding index values
+  #create function that takes block, indices and values and returns scalar for those
+  #create block for global read
+  #
+  index = np.zeros(len(d.indices), dtype=int)
+  r = s
+  for i in range(a.spillover, -1, -1) :
+    index[i] = r / a.block[i]
+    r = r % a.block[i]
+
+  #sm scalar entry  (leaving read only indexes at 0 for now)
+  sm = 0
+#  for i in range(a.spillover+1):
+#    sm = sm + paddedBlock[i] * index[i]
+
+  for ci, i in enumerate(c.indices) :
+    #exhausting: if read order index i (at position ci in combined block and i in read block) is part of the read block,
+    if i <= a.spillover :
+      #add read block index i as multiple of paddedBlock at position ci (even that simplifies as ci == i for read block)
+      sm = sm + c.block[ci] * index[i]
+
+  return sm
 
 
 
