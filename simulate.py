@@ -85,22 +85,56 @@ def rwblock( shape, out, N, divisors, block=None ) :
       z = z + 1 
   c.indices = combined[:z]
 
-  #the final shape of combined rw
+  #the final shape of combined rw shared memory, also intervals and completion intervals for counting through precalc
   c.shape = np.zeros( z, dtype=int )
-  for i in range(z) : c.shape[i] = shape[c.indices[i]]
+  c.interval = np.zeros( z, dtype=int )
+  c.completion = np.zeros( z, dtype=int )
+  a.completion = np.zeros( a.spillover+1, dtype=int )
+  b.completion = np.zeros( b.spillover+1, dtype=int )
+  for i in range(z) : c.shape[i]      = shape[c.indices[i]]
+  for i in range(z) : c.interval[i]   = shape[c.indices[i]]
+  for i in range(z) : c.completion[i] = shape[c.indices[i]]
+  for i in range(a.spillover+1) : a.completion[i] = shape[i]
+  for i in range(b.spillover+1) : b.completion[i] = shape[out[i]]
   if rout[a.spillover] == b.spillover :
     if    a.interval <  b.interval :
-      c.shape[ c_a_spillover ] = b.interval;  
+      c.shape     [ c.a_spillover ] = b.interval;  
       a.loop, b.loop = True, False
+      c.interval  [c.a_spillover] = a.interval
+      c.completion[c.a_spillover] = b.interval
+      a.completion[a.spillover] = b.interval
+      b.completion[b.spillover] = b.interval
     elif  a.interval >  b.interval :
       c.shape[ c.a_spillover ] = a.interval;  
       a.loop, b.loop = False, True 
+      c.interval  [c.a_spillover] = b.interval 
+      c.completion[c.a_spillover] = a.interval
+      #!does this even make sense on combined c level. Depending on read vs write, completion vs interval.
+      #rather, distinguish. Ok now I have int/cint everywhere, just need to figure out how to use it.
+      a.completion[a.spillover] = a.interval
+      b.completion[b.spillover] = a.interval
     else : #==
       c.shape[ c.a_spillover ] = a.interval;  
       a.loop, b.loop = False, False
+      c.interval  [c.a_spillover] = a.interval
+      c.completion[c.a_spillover] = a.interval
+      a.completion[a.spillover] = a.interval
+      b.completion[b.spillover] = a.interval
+  #!this doesn't set the shape if spillovers are distinct and not contained (=interval) vs distinct and contained (=shape)
+  #!which means the block size below is wrong when it uses shape instead of interval
+  #fixed:
+  else
+    if rout[a.spillover] > b.spillover : #a spillover is distinct and not contained in b
+      c.shape[c.a_spillover] = a.interval
+      a.completion[a.spillover] = a.interval
+    if a.spillover < out[b.spillover]  : #b spillover is distinct and not contained in a
+      c.shape[c.b_spillover] = b.interval
+      b.completion[b.spillover] = b.interval
 
 
-  #now forward expand the block sizes
+
+
+  #now forward expand the block sizes (sm block)
   #(this still will be padded later)
   #(read padding is not carried over here because there is no point: bank memory does not have to be aligned, only 
   # consecutive) 
@@ -290,13 +324,13 @@ def loops( N, bankN, a, b, c, out ) :
   d = struct()
   notb = np.array(out)[b.spillover:]
   d.indices = notb[ np.where(notb >= a.spillover) ]
-  d.indices = np.extract(notb >= a.spillover, notb)
+  d.indices = np.extract(notb >= a.spillover, notb)  #$
   d.steps = np.ones(len(d.indices), dtype=int)
 
   #set steps to spillover if in remaining dims
   if a.spillover in d.indices :
     aspi, = np.where( d.indices == a.spillover )  #I don't want to select first index and tuple every time 
-    aspi = list(d.indices).index(a.spillover)
+    aspi = list(d.indices).index(a.spillover)  #$
     if a.spillover  ==  out[b.spillover] :
       d.steps[aspi] = max( a.interval, b.interval )
     else :
@@ -312,6 +346,7 @@ def loops( N, bankN, a, b, c, out ) :
   d.GN = GN
 
  
+  #takes indices to gl read order and returns corresponding block (steps reduce the size of the block)
   def blocken( indices, steps ) :
     block = np.zeros(len(indices), dtype=int)
     block[0] = 1
@@ -321,6 +356,7 @@ def loops( N, bankN, a, b, c, out ) :
 
   d.block = blocken( d.indices )
 
+  #takes block and splits up number into corresponding index values
   def indexen( s, block ) :
     index = np.zeros(len(block), dtype=int)
     r = s
@@ -329,40 +365,143 @@ def loops( N, bankN, a, b, c, out ) :
       r = r % block[i]
     return index 
 
+  #takes block, indices and values and returns scalar for those. Steps multiply index values. 
   #here the block is supposed to be larger than indices (e.g. full global read block)
-  def scalar( block, indices, index ) :
+  def scalar( block, indices, index, steps ) :
     s = 0
     for i in range(len(indices)) :
-      s = s + block[indices[i]] * index[i]
+      s = s + block[indices[i]] * index[i] * steps[i]
     return s 
 
+
+
   #scalar thread block to scalar global read
-  def map_global_read( s ) :
+  #s to loop over number of global thread blocks d.GN
+  def thread_block( s ) :
+    index = indexen( s, d.block ) 
+    grs = scalar( a.block, d.indices, index, d.steps )
 
-  #*global block only, to break up s, and global read block to get new scalar
-  #*create function that takes shape (or indices) and returns corresponding block 
-  #*create function that takes block and splits up number into corresponding index values
-  #create function that takes block, indices and values and returns scalar for those
-  #create block for global read
-  #
-  index = np.zeros(len(d.indices), dtype=int)
-  r = s
-  for i in range(a.spillover, -1, -1) :
-    index[i] = r / a.block[i]
-    r = r % a.block[i]
+    #checking for partials, return the partial or regular interval
+    def partial_check( dim, d )
+      i = list(d.indices).index(dim) 
+      #if index[i] * (d.steps[i]+1) > shape[dim] : #it's a partial  #!shouldn't it be index[i]+1?
+      if (index[i]+1) * d.steps[i] > shape[dim] : #it's a partial  
+        return shape[dim]  %  d.steps[i]     
+      else 
+        return d.steps[i]     
 
-  #sm scalar entry  (leaving read only indexes at 0 for now)
-  sm = 0
-#  for i in range(a.spillover+1):
-#    sm = sm + paddedBlock[i] * index[i]
+    #!this doesn't look right when a/b same spillover, the max will be d.step, partial completion both in read and write step
+    if a.spillover in d.indices :
+      completion_interval_a = partial_check( a.spillover, d )
+    if out[b.spillover] in d.indices :
+      completion_interval_b = partial_check( out[b.spillover], d )
 
-  for ci, i in enumerate(c.indices) :
-    #exhausting: if read order index i (at position ci in combined block and i in read block) is part of the read block,
-    if i <= a.spillover :
-      #add read block index i as multiple of paddedBlock at position ci (even that simplifies as ci == i for read block)
-      sm = sm + c.block[ci] * index[i]
+    #recap: we are in global loop at s in range(d.GN)
 
-  return sm
+
+
+    #start the sm loop passing down partial loop via completion interval
+    def sm_read_outer( completion_interval_a, completion_interval_b, thread ) : 
+      #compute the universal outer loop global part of address for global and sm 
+      #compute thread specific inner part of address
+      #second inner loop adds multiple of read inner block (somewhere need to check vs N and this block size), just store that block size
+
+
+      #DEAD BLOCK
+      #outer loop over b only block. There may be a second loop over a.spillover dim if also in b
+      #b and not a
+      outy = np.array(out)
+      b_only = np.extract(outy[:b.spillover+1] > a.spillover, outy )  #$
+
+
+      first_outer_completion = list(c.indices).index(a.spillover)  #is also just equal itself, since a has consecutive indices.
+      first_outer_interval = first_outer_completion + 1  #note this is wrt c indices order, it's the next index, if any (otherwise gives empty loop, ok)
+
+      #set the completions and intervals
+      z = len(c.indices)
+      c.interval = np.zeros(z, dtype=int)
+      c.completion = np.zeros(z, dtype=int)
+      for i in range(z) :
+        #!fuck does c shape reflect if a spillover is a regular b dimension. where did I store this info
+        c.interval[i]   = c.shape[i] #c shape is already truncated to 2nd loop 
+        c.completion[i] = c.shape[i]
+       
+
+
+      prec = np.zeros( c.shape_block[-1] * c.shape[-1] ) #outer size no more than that
+      completion_prec_index = -1  #which outer array entry has the inner completion interval, if any (there can only be one per thread block)
+      precN = 0
+      #recursive implies depth first search, I accumulate the total address by passing down the outer block scalar so
+      #an array entry is only written at the leaf loop which is at the first outer completion (loop or not)
+
+      #recurse each dimension from highest to lowest (same as cascading up)
+      def loopy( i, so )
+        if i >= first_outer_completion :
+	  j = 0
+	  #completion loop
+          while j * c.interval[i]  <  c.completion[i] :
+	    
+            if (j+1) * c.interval[i]  <=  c.completion[i] :
+              interval = c.interval[i]
+	    else :
+	      interval = c.completion[i] - j*c.interval[i]
+	      if first_outer_completion  ==  i :  #I don't like dual meaning of i as c index and read order index
+	        completion_prec_index = precN 
+
+	    if i == first_outer_completion :  #write at the outer leaf node, which is always the first outer completion (a's spillover)
+              prec[precN] = so + j * c.interval[i] * c.block[i] 
+	      precN = precN + 1
+	    else :
+	      for k in range(interval) :
+                loopy( i-1, so + (j * c.interval[i] + k) * c.block[i] )
+               
+	    j = j + 1
+      
+      loopy( len(c.indices), 0 )
+      #recap: prec now has all the outer scalars for the shared memory, precN is the size, and completion prec index has the leaf completion, only if partial
+	      
+	    
+
+      #loop over standard size (interval) and extended (completion interval) on each dimension, just to unify the cases.
+      #The only required order is thread interval to be the innermost loop.
+      #The inner read indices are the first indices in the combined read block, and the first completion interval is always 
+      #the last of the inner read indices. So it is sufficient to look at the combined block. Two feasible spins: All intervals in indices order,
+      #then all completions in any order. Or each interval and completion, in indices order. 
+      #The latter option preserves the natural sequence.
+
+      #Don't forget that coming in I have a thread index and block index, so the loop needs to be over t and b. With precomputed,
+      #I can index with t directly for inner scalar. The rest of the rw is an actual loop resulting in c/a sm and global parts that are stored in arrays.
+      #Partial can come from any partial completion, whether or not completion index is regular or passed down from global.
+    
+      #But: global completion can completely change the local sm completion, say from 4,19 to 4,6, cutting short some loop indices and interjecting
+      #partial T at different points. So the precomputed array is shortened somewhere (hopefully at the end), and additional T is passed.
+      #If you have two seperate completion intervals, that would still put one index loop before the other, no matter which spin.
+ 
+      #Since I unroll the dimensions into more or less into sqrt*sqrt, the actual precalculated arrays are 4*64  for threads and sm for both read and write.
+      #If I create arrays for the 3 cases (one or two active completion intervals), the precalc is 64*(2+2+6) = 64*10. That is still amortized, but starts
+      #encroaching. As far as memory usage, 64*64 = 4096 sm can be upped by 10x, in particular, 4x should be fine e.g. from 128 threads, for better amortization.
+      #So at least in principle, the precalc overhead should be tolerable. Worst case I could cut it down to one extra array instead of 3, by manually
+      #shortening the outer one.
+
+      #Ok, so split into a including interval, and everything else. But how to split up the int vs completion int. Well I guess by having two
+      #start indices, one for intervals and one for the completions. Then I can still do both options.
+      #cases spillover for outer loop read:
+      #a or b totally distinct: b distinct: loop over b.interval, not dim
+      #a contained in b dim: b dim becomes second loop for a
+      #a shared with b: if a in b, second loop for a. Otherwise, nothing on outer loop for b, dim belongs to a inner 
+      #b contained in a dim: nothing for b loop, dim belongs to a inner
+      #sum.: second loop if a in b shared or not shared. b spill dim loop only if distinct 
+      #steps are used for global counts. So rather, interval and completion interval. Lets try again:
+      #normal: int and cint = shape. distinct b spill: int and cint = step. second loop: a.int = step, a.cint = b.int (which is shape or not)
+      #threads don't spillover into cints, because first ints are taken for spin, then cints. Or rather: a.ints > a.cints > b.ints > b.cints
+      #each of these 4 loops gives additive addresses, so need to store 4 arrays
+      #whenever the a.cint is smaller than a.int (first or final loop), results in partial thread allocation. For b, just partial loop.
+      
+
+
+    #global thread block loop 
+    for thread in range(N) :
+      sm_read_outer( completion_interval_a, completion_interval_b, thread )
 
 
 
