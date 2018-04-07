@@ -85,51 +85,41 @@ def rwblock( shape, out, N, divisors, block=None ) :
       z = z + 1 
   c.indices = combined[:z]
 
+  cr, cw = struct(), struct()
   #the final shape of combined rw shared memory, also intervals and completion intervals for counting through precalc
   c.shape = np.zeros( z, dtype=int )
-  c.interval = np.zeros( z, dtype=int )
-  c.completion = np.zeros( z, dtype=int )
-  a.completion = np.zeros( a.spillover+1, dtype=int )
-  b.completion = np.zeros( b.spillover+1, dtype=int )
+  cr.interval   = np.zeros( z, dtype=int )
+  cr.completion = np.zeros( z, dtype=int )
+  #!for cw, I actually first need c indices in write order, so can loop outermost first also
   for i in range(z) : c.shape[i]      = shape[c.indices[i]]
-  for i in range(z) : c.interval[i]   = shape[c.indices[i]]
-  for i in range(z) : c.completion[i] = shape[c.indices[i]]
-  for i in range(a.spillover+1) : a.completion[i] = shape[i]
-  for i in range(b.spillover+1) : b.completion[i] = shape[out[i]]
+  for i in range(z) : cr.interval[i]   = shape[c.indices[i]]
+  for i in range(z) : cr.completion[i] = shape[c.indices[i]]
   if rout[a.spillover] == b.spillover :
     if    a.interval <  b.interval :
       c.shape     [ c.a_spillover ] = b.interval;  
       a.loop, b.loop = True, False
-      c.interval  [c.a_spillover] = a.interval
-      c.completion[c.a_spillover] = b.interval
-      a.completion[a.spillover] = b.interval
-      b.completion[b.spillover] = b.interval
+      cr.interval  [c.a_spillover] = a.interval
+      cr.completion[c.a_spillover] = b.interval
     elif  a.interval >  b.interval :
       c.shape[ c.a_spillover ] = a.interval;  
       a.loop, b.loop = False, True 
-      c.interval  [c.a_spillover] = b.interval 
-      c.completion[c.a_spillover] = a.interval
-      #!does this even make sense on combined c level. Depending on read vs write, completion vs interval.
-      #rather, distinguish. Ok now I have int/cint everywhere, just need to figure out how to use it.
-      a.completion[a.spillover] = a.interval
-      b.completion[b.spillover] = a.interval
+      cr.interval  [c.a_spillover] = a.interval 
+      cr.completion[c.a_spillover] = a.interval
     else : #==
       c.shape[ c.a_spillover ] = a.interval;  
       a.loop, b.loop = False, False
-      c.interval  [c.a_spillover] = a.interval
-      c.completion[c.a_spillover] = a.interval
-      a.completion[a.spillover] = a.interval
-      b.completion[b.spillover] = a.interval
+      cr.interval  [c.a_spillover] = a.interval
+      cr.completion[c.a_spillover] = a.interval
   #!this doesn't set the shape if spillovers are distinct and not contained (=interval) vs distinct and contained (=shape)
   #!which means the block size below is wrong when it uses shape instead of interval
   #fixed:
   else
     if rout[a.spillover] > b.spillover : #a spillover is distinct and not contained in b
       c.shape[c.a_spillover] = a.interval
-      a.completion[a.spillover] = a.interval
+      cr.interval  [c.a_spillover] = a.interval #completion = shape
     if a.spillover < out[b.spillover]  : #b spillover is distinct and not contained in a
       c.shape[c.b_spillover] = b.interval
-      b.completion[b.spillover] = b.interval
+      cr.interval  [c.b_spillover] = b.interval #completion = shape
 
 
 
@@ -391,6 +381,7 @@ def loops( N, bankN, a, b, c, out ) :
         return d.steps[i]     
 
     #!this doesn't look right when a/b same spillover, the max will be d.step, partial completion both in read and write step
+    completion_interval_a, completion_interval_b = None, None
     if a.spillover in d.indices :
       completion_interval_a = partial_check( a.spillover, d )
     if out[b.spillover] in d.indices :
@@ -401,11 +392,17 @@ def loops( N, bankN, a, b, c, out ) :
 
 
     #start the sm loop passing down partial loop via completion interval
-    def sm_read_outer( completion_interval_a, completion_interval_b, thread ) : 
+    def sm_read_outer( completion_interval_a, completion_interval_b ) : 
       #compute the universal outer loop global part of address for global and sm 
       #compute thread specific inner part of address
       #second inner loop adds multiple of read inner block (somewhere need to check vs N and this block size), just store that block size
 
+      #passing down partial completions (sets partial or full, if spillovers are completed in d. Not set if spillovers are included)
+      crp = np.copy( cr) 
+      if completion_interval_a != None :
+        cr.completion[c.a_spillover] = completion_interval_a #doesn't matter whether a or b is dominant, d only sees outer larger step. Same for inclusion.
+      if completion_interval_b != None :
+        cr.completion[c.b_spillover] = completion_interval_b #if spillovers are same, so are the intervals 
 
       #DEAD BLOCK
       #outer loop over b only block. There may be a second loop over a.spillover dim if also in b
@@ -417,16 +414,6 @@ def loops( N, bankN, a, b, c, out ) :
       first_outer_completion = list(c.indices).index(a.spillover)  #is also just equal itself, since a has consecutive indices.
       first_outer_interval = first_outer_completion + 1  #note this is wrt c indices order, it's the next index, if any (otherwise gives empty loop, ok)
 
-      #set the completions and intervals
-      z = len(c.indices)
-      c.interval = np.zeros(z, dtype=int)
-      c.completion = np.zeros(z, dtype=int)
-      for i in range(z) :
-        #!fuck does c shape reflect if a spillover is a regular b dimension. where did I store this info
-        c.interval[i]   = c.shape[i] #c shape is already truncated to 2nd loop 
-        c.completion[i] = c.shape[i]
-       
-
 
       prec = np.zeros( c.shape_block[-1] * c.shape[-1] ) #outer size no more than that
       completion_prec_index = -1  #which outer array entry has the inner completion interval, if any (there can only be one per thread block)
@@ -434,32 +421,34 @@ def loops( N, bankN, a, b, c, out ) :
       #recursive implies depth first search, I accumulate the total address by passing down the outer block scalar so
       #an array entry is only written at the leaf loop which is at the first outer completion (loop or not)
 
-      #recurse each dimension from highest to lowest (same as cascading up)
-      def loopy( i, so )
+      #recurse each dimension in combined from highest to lowest up to a (so really, b-a) (same as cascading up)
+      def loopy( i, so, cc )   #pass in cc as cr or cw
         if i >= first_outer_completion :
 	  j = 0
 	  #completion loop
-          while j * c.interval[i]  <  c.completion[i] :
+          while j * cc.interval[i]  <  cc.completion[i] :
 	    
-            if (j+1) * c.interval[i]  <=  c.completion[i] :
-              interval = c.interval[i]
+            if (j+1) * cc.interval[i]  <=  cc.completion[i] :
+              interval = cc.interval[i]
 	    else :
-	      interval = c.completion[i] - j*c.interval[i]
+	      interval = cc.completion[i] - j*cc.interval[i]
 	      if first_outer_completion  ==  i :  #I don't like dual meaning of i as c index and read order index
 	        completion_prec_index = precN 
 
 	    if i == first_outer_completion :  #write at the outer leaf node, which is always the first outer completion (a's spillover)
-              prec[precN] = so + j * c.interval[i] * c.block[i] 
+              prec[precN] = so + j * cc.interval[i] * c.block[i] 
 	      precN = precN + 1
 	    else :
 	      for k in range(interval) :
-                loopy( i-1, so + (j * c.interval[i] + k) * c.block[i] )
+                loopy( i-1, so + (j * cc.interval[i] + k) * c.block[i] )
                
 	    j = j + 1
       
-      loopy( len(c.indices), 0 )
-      #recap: prec now has all the outer scalars for the shared memory, precN is the size, and completion prec index has the leaf completion, only if partial
-	      
+      loopy( len(c.indices), 0, cr )
+      return prec, completion_prec_index
+      #recap: prec now has all the outer scalars for the read shared memory, precN is the size, and completion prec index has the leaf completion, only if partial
+      #TODO: same for cw, first have to order/create cw, as well as sort c really.. Still haven't passed down the partial completion, which should be done
+      #in c
 	    
 
       #loop over standard size (interval) and extended (completion interval) on each dimension, just to unify the cases.
@@ -496,13 +485,186 @@ def loops( N, bankN, a, b, c, out ) :
       #threads don't spillover into cints, because first ints are taken for spin, then cints. Or rather: a.ints > a.cints > b.ints > b.cints
       #each of these 4 loops gives additive addresses, so need to store 4 arrays
       #whenever the a.cint is smaller than a.int (first or final loop), results in partial thread allocation. For b, just partial loop.
-      
+      #Completions are different depending if this is the read or write pass.
 
 
-    #global thread block loop 
+    #ok lets finish the read pass. Unwrap the threads
+
+    #set the outer array. Note this depends on the partial intervals, ie which global thread block s
+    prec, completion_prec_index = sm_read_outer( completion_interval_a, completion_interval_b )
+
+    #set the inner array
     for thread in range(N) :
-      sm_read_outer( completion_interval_a, completion_interval_b, thread )
+    #do I need recursive here too? why did I need it? to count coalescing fashion, so I guess same here. The leaf obviously is 
+    #the first dimension, but not the completion but the interval loop. 
+    
+      #pass in cc as cr or cw. Inner loop. Again, intervals then completions, one index at a time bottom up. Looks reverse in recursion.
+      def loopi( i, so, cc )  
+
+        if i <= first_outer_completion : #!this is really just a.spillover, above as well so why not call it that
+	  j = 0
+	  #completion loop
+          while j * cc.interval[i]  <  cc.completion[i] :
+	    
+            if (j+1) * cc.interval[i]  <=  cc.completion[i] :
+              interval = cc.interval[i]
+	    else :
+	      interval = cc.completion[i] - j*cc.interval[i]
+	      #ok so do I mark this again? Partials happen, but only in spills, and only had to pass down on first spill so threads know
+	      #This is wrong anyways: the partial will be looping repeatedly hitting partial every loop, overwriting completion_prec_index.
+              #!!CONT: fix this. Recap again what I need in the multiple array versions.
+	      #basically the partial(s) will be repeated as many times as there are other dimension intervals. The only way to prevent that
+	      #is by doing own unroll on the completion intervall. Damn it, can I at least address these special cases in one place once and for all?
+
+              #also was ist diese construktion: nimm (a1*k + b), wrap that into a2 multiples plus k2, ok that would be my padded block really,
+	      #where dimensions are seperate from block padding. But here, I take multiples, then cut them once, then take multiples of that, then cut 
+	      #that, take multiples of that, cut that etc. The cuts is always to arbitrary length starting at unit, so the next size is also 
+	      #completely arbitray can be anything. It's simply an increasing size that doesn't have to align on multiples of the lower dimension, 
+	      #but you just compute the number of multiples of previous size plus rest.
+	      #it's simply a scheme with arbitrary block size at each dimension, same as the block padding, except the remainder is part of the data.
+	      #To address such a number, one would use the fully contained multiples as dimension indices, and a padding block as follows: 
+	      #a padding number on any index level indicates dim*block + that number for that position, but of course depends on the upper level indices
+	      #amount of dim+1 blocks. So a padding number is always final, there is no combination of a lower and higher padding number, as padding
+	      #is always in base units. So the padding indicator is a padding number and on which index, whereas the regular dims are also fully provided.
+	      #typically the padding compound is empty, say default 0 at dimension 0
+	      #To fully enumerate positions, the final loop before upstream index is increased (cascading) is the padded size on top of the finished lower block
+	      #A variation of that is to not have unit 1 padding at given index, but rather one block size down.
+	      #This gives rise to concept of co-dimension, referring to any lower dimensions or codimensions. Regular cases are padding index, where
+	      #the codimension refers to lowest block size 1, and upstream always refers to/'wraps' complete block (dim + co dim). Another case is 
+	      #spillover, where codimension refers to immediate lower block as well (smaller dim here), and upstream has two codims each referring the respective
+	      #codims below, second one having dim 1. Further upstream wraps. The case of shared spillover: The first codimension is from the remainder
+	      #in b spillover wrt a spillover (a spillover is a new dimension now, and codim is residual wrt b). The existing containing dim's residual wrt
+	      #combined codims (div+1) gives the next level of codims, first wrapping (div+1) level of lower codims, while the second is actually
+	      #on the same level as the first codim. The size of the codims translates into partials of the number of threads.
+	      #the second codim isnt' a re-rendering of the b codim, we're only measuring it against the a codim because we have to as submitting whole
+	      #thread instructions as a given multiple of the common dim.
+	      # In principle this regularity is the same as the padding, except the universe is a single dim that is split into multiples of wrapped previous
+	      #sizes, and instead of unit 1 you have the previous block as common dim. Or better: the remainder is always in the common block size (like pad),
+	      #so it is exactly like pad, unlike the second regular case where codim block size moves up.
+	      # So best view would be: b and multiple remainder are the codims, with a interjected/projected into both for threads.
+              # b and remainder as codims both are split into inner and second loop the same way, or form two different blocks.
+	      #Does this help in any way for the cases? Ok so now the inclusion case is same as shared, a and remainder are codims, being split up into
+	      #inner and second loop (trivial), and for nonactive spillover, in inclusion, the codim layer itself (only one active at a time) goes to 
+	      #outer loop, while the wrapper layer belongs to that loop as well, or to global loop if no inclusion (in the +1 case, the wrapper layer 
+	      #is simplified into number of partial divisions, but
+	      #must note the final partial so not really simplification might as well make it explicit multiples + 1). So layers not split on locations,
+	      #except the thread loop but that's a projection. Difference in shared and non-shared inclusive: shared b is the codim vs a, and two layers
+	      #of same block ref. 
+	      # Automatic build of shared spill: give rules: same dims are sorted by completion (rest is global), building up smallest first, and the 
+	      #build is like the padding example: layer to larger completion with same underlying block with fill and remainder. Note the remainder is 
+	      #wrt to next in the list of same dim, and full dim = global if not there. 
+	      #There is actually nothing special about a: if just so happens that thread N fills it, the remainder codim doesn't so N is truncated.
+	      #All that needs to be done is associate anything that references the a unit blocks directly with the N loop, ie the a codim, remainder -
+	      #NOT b because b references a+rem, not the a unit block directly, BUT b's remainder does (its always next layer is wrap + new unit remainder.)
+	      #EXCEPT THIS STILL FUCKNG DOESNT WORK BECAUSE b remainder could be bigger than a so cant throw it at threads. So no, b's remainder 
+	      #has to be treated like another a block, so that 1 codim actually wraps another 2 codims on the same layer as the a codims.
+	      #Dont forget: codims typically reference the same underlying dim, but the upper references them seperately. 
+	      #>>The meaning is simply the #cascading is done on the underlying tree of each codim, sequentially for all codims on a layer.
+	      #>>The main point is: b codim will be on next level, but its remainder codim will point to same codim layer as a codim (whether a or a copy),
+	      #adding another rem codim at that layer. (The a spill codim is special)
+	      # Now with global completion for a dimension, how do I pull this tree into outer vs global enumeration?
+	      #Well any layers can be looped seperately, just need to be multiplied by underlying layer block, and don't forget the codims are sequentially
+	      #placed, ie first need to add all full codim blocks to the left
+
+              #Algo just so I have a uniform way of getting there:
+	      #Data structure: layer, has ordered codims, each has a size, and points to a list of codims in a lower layer
+	      #Create a list bottom up of dimensions, with repeated dimensions sorted by completion, and ownership of each as local or global.
+	      #(ownership is wrt the loop a codim layer creates, and each list entry creates a codim layer)
+              #By default, each codim wraps all lower layer codims.
+	      #A single entry creates a single codim in one layer.
+	      #If more than one entry, take sequential pairs, each forming two multiple/resid codim layers (size and residual, then multiple + 1, 
+	      #referencing corresponding, not wrapped), all referencing same lower level wrap as usual.
+	      #Actually the only time there are two pairs is with shared spill, 
+
+              #the b/global loop splits dim into b / resid, but only one layer: the two lower layers wrapped are b, the new layer gives b multiple in full dim
+	      #but that doesn't work. The residual always needs to be next to the size, ie b codim. 
+              #Actually build it top down: the right most pair gives dim/b, 1, dim/b res. It gives placeholders b(/a) and resdim/b(/a) and 1s, 
+	      #then a is filled in from the first pair, and adds matched layer a, res b/a etc. If this was going on, then instead of  
+	      #a, there would be  mul a/c, 1, etc placeholders.
+	      #IOW: size codims get replaces by size/c,1 each, and a corresponding lower layer (which would be replaced again if it continues)
+
+	      #Ok, so I'm going to create algo that creates the recursible data structure to run through the numbers. while the reverse codim builds
+	      #ending in a, can take the a-layer and below as the loop for the inner. The tree is built in dim order only so that the right
+	      #block sizes get associated with it, but that isn't really necessary as block belongs to dim. Dims are not connected in any way otherwise.
+              #it is only relevant that the inner order reflects contiguous memory, everything else shouldn't be relevant. Layers of the tree
+	      #corresponding to different dims can be pulled/counted separately; the connections down always include all codims (wrap).
+	      #in case of say spillover in global, the mult layer (outer of the pair is global) belongs to global, the inner of pair to inner, the 
+	      #connections are codim respective though and the layers can't be separated: what this means is you cannot count down the two inner codims,
+	      #by themselves, the global links activates them. That also means that anything below these codims has to be activated the same way, so 
+	      #can't be pulled over to count independently. Actually it doesn't mean that: on the next dim layer, everything flows back together, ie
+	      #is activated in any upper branch, only the seperate codim blocks matter for the total address. Eg active N is only affected by the a layer
+	      #times the a block.
+
+	      #So there are dependent layers that cannot be counted separately, resulting in mapping global block address first to determine which codim
+	      #is active, then starting associated lower layer loop (nonglobal)
+
+              #OMG. is this dealt with: b spill < a spill means same as say a spill in a b dim: there is no counting.
+
+              if first_outer_completion  ==  i :  #I don't like dual meaning of i as c index and read order index
+	        completion_prec_index = precN 
+
+	    if i == first_outer_completion :  #write at the outer leaf node, which is always the first outer completion (a's spillover)
+              prec[precN] = so + j * cc.interval[i] * c.block[i] 
+	      precN = precN + 1
+	    else :
+	      for k in range(interval) :
+                loopy( i-1, so + (j * cc.interval[i] + k) * c.block[i] )
+               
+	    j = j + 1
+      
+      loopy( len(c.indices), 0, cr )
+      return prec, completion_prec_index
 
 
 
+  #Create cascading graph to fully enumerate tensor,
+  #corresponding to a codimension rollup that is extremely flexible. Example representation:  A(B|C)(D||E|F)G, | : active sequentially, || : only one active
+  #Any layer has one or more codimensions, which each link to a list of one or more codimensions in a lower level, typically the next one. The linked
+  #codimensions are evaluated sequentially, not together.
+  def create_cascade() : 
 
+    #process dimensions last to first top down so that the tree leaf is always the contiguous dim
+    #Each dim is a list of completions, ordered smallest to largest (and processed in reverse order as well)
+    #c has enough info to directly construct that list 
+    h = struct()
+    h.dim = []
+    for i in reversed(range(D)) :
+      completions =  []
+      #add the dim completion, and a and/or b spillover TODO
+      if i not in c.indices  or  ((i == c.indices[a_spillover] or i == c.indices[b_spillover])  and  shape[i] > a.interval
+      e = struct()
+      e.completion = shape[i]
+      e.index = i
+      #global or spillover dimension (in either case global dim has stake, also if spill is full, for uniformity)
+      if i >= a.spillover  and  i not in out[:b.spillover]  
+        e.type = 'global'
+      #fully covered dim
+      else
+        e.type = 'local'
+      completions[:0] = [e]
+
+      #add any spillovers (note, contained spills are removed, except a is never removed because it is the pivot)
+      #if shared, b only if larger
+      if (i == a.spillover  and  i == out[b.spillover]  and  b.interval > a.interval) :  #note: there cannot be full dim containing b in this case
+      or (i != a.spillover  and  i == out[b.spillover]  and  completions[-1].type == 'global')
+        e = struct()
+        e.type = 'spill'
+	      e.completion = b.interval
+	      e.index = i
+        completions[:0] = [e]
+      #a always goes in (first)
+      if i == a.spillover  
+        e = struct()
+        e.type = 'pivot'
+	      e.completion = a.interval
+	      e.index = i
+        completions[:0] = [e]
+	  
+      h.dim[:0] = [ completions ]  #prepend. 
+
+      assert(len(h.dim) ==  D)
+      #yay, inputs structure for read is complete
+
+
+    #Then unroll segments for prec, by splitting h into inner and outer (incl second loop), ie all layers of a, and remainder without global, 
+    #but so that the || codims result in separate unrolls (which I might do special unroll just for that layer, so other precalc arrays are same).
