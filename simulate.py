@@ -113,7 +113,7 @@ def rwblock( shape, out, N, divisors, block=None ) :
   #!this doesn't set the shape if spillovers are distinct and not contained (=interval) vs distinct and contained (=shape)
   #!which means the block size below is wrong when it uses shape instead of interval
   #fixed:
-  else
+  else :
     if rout[a.spillover] > b.spillover : #a spillover is distinct and not contained in b
       c.shape[c.a_spillover] = a.interval
       cr.interval  [c.a_spillover] = a.interval #completion = shape
@@ -165,7 +165,6 @@ def bank_padding( a, b, c, out, bankN ) :
 #  for i in range(D) : paddedBlock[i] = a.block[i]
   for i in range(z) : paddedBlock[i] = c.shape_block[i]
  
-#  from pdb import set_trace; set_trace()
 
 #  for r in range(D) : #i is global read dimension
   for i,r in enumerate(c.indices) : #i is global read dimension
@@ -372,12 +371,12 @@ def loops( N, bankN, a, b, c, out ) :
     grs = scalar( a.block, d.indices, index, d.steps )
 
     #checking for partials, return the partial or regular interval
-    def partial_check( dim, d )
+    def partial_check( dim, d ) :
       i = list(d.indices).index(dim) 
       #if index[i] * (d.steps[i]+1) > shape[dim] : #it's a partial  #!shouldn't it be index[i]+1?
       if (index[i]+1) * d.steps[i] > shape[dim] : #it's a partial  
         return shape[dim]  %  d.steps[i]     
-      else 
+      else :
         return d.steps[i]     
 
     #!this doesn't look right when a/b same spillover, the max will be d.step, partial completion both in read and write step
@@ -422,7 +421,7 @@ def loops( N, bankN, a, b, c, out ) :
       #an array entry is only written at the leaf loop which is at the first outer completion (loop or not)
 
       #recurse each dimension in combined from highest to lowest up to a (so really, b-a) (same as cascading up)
-      def loopy( i, so, cc )   #pass in cc as cr or cw
+      def loopy( i, so, cc ) :  #pass in cc as cr or cw
         if i >= first_outer_completion :
 	  j = 0
 	  #completion loop
@@ -499,7 +498,7 @@ def loops( N, bankN, a, b, c, out ) :
     #the first dimension, but not the completion but the interval loop. 
     
       #pass in cc as cr or cw. Inner loop. Again, intervals then completions, one index at a time bottom up. Looks reverse in recursion.
-      def loopi( i, so, cc )  
+      def loopi( i, so, cc ) :
 
         if i <= first_outer_completion : #!this is really just a.spillover, above as well so why not call it that
 	  j = 0
@@ -617,54 +616,103 @@ def loops( N, bankN, a, b, c, out ) :
 
 
 
-  #Create cascading graph to fully enumerate tensor,
-  #corresponding to a codimension rollup that is extremely flexible. Example representation:  A(B|C)(D||E|F)G, | : active sequentially, || : only one active
-  #Any layer has one or more codimensions, which each link to a list of one or more codimensions in a lower level, typically the next one. The linked
-  #codimensions are evaluated sequentially, not together.
-  def create_cascade() : 
+
+#Create cascading graph to fully enumerate tensor,
+#corresponding to a codimension rollup that is extremely flexible. Example representation:  A(B|C)(D||E|F)G, | : active sequentially, || : only one active
+#Any layer has one or more codimensions, which each link to a list of one or more codimensions in a lower level, typically the next one. The linked
+#codimensions are evaluated sequentially, not together.
+
+#create input dimensions structure for cascade structure: each dim is a list of ordered completions
+def arbelo_input( shape, out, a, b ) : 
+    D = len(shape)
 
     #process dimensions last to first top down so that the tree leaf is always the contiguous dim
     #Each dim is a list of completions, ordered smallest to largest (and processed in reverse order as well)
     #c has enough info to directly construct that list 
     h = struct()
     h.dim = []
-    for i in reversed(range(D)) :
+    for i in reversed(range(D)) :  #top down construction not really necessary, any order
       completions =  []
       #add the dim completion, and a and/or b spillover TODO
-      if i not in c.indices  or  ((i == c.indices[a_spillover] or i == c.indices[b_spillover])  and  shape[i] > a.interval
       e = struct()
       e.completion = shape[i]
       e.index = i
       #global or spillover dimension (in either case global dim has stake, also if spill is full, for uniformity)
-      if i >= a.spillover  and  i not in out[:b.spillover]  
+      if i >= a.spillover  and  i not in out[:b.spillover] : 
         e.type = 'global'
       #fully covered dim
-      else
+      else :
         e.type = 'local'
       completions[:0] = [e]
 
       #add any spillovers (note, contained spills are removed, except a is never removed because it is the pivot)
-      #if shared, b only if larger
-      if (i == a.spillover  and  i == out[b.spillover]  and  b.interval > a.interval) :  #note: there cannot be full dim containing b in this case
-      or (i != a.spillover  and  i == out[b.spillover]  and  completions[-1].type == 'global')
+      #if shared, b only if larger. Note: there cannot be full dim containing b in this case  
+      #Note: piece of shit python needs either \ or () to allow multiline condition
+      if  (i == a.spillover  and  i == out[b.spillover]  and  b.interval > a.interval)  or   \
+          (i != a.spillover  and  i == out[b.spillover]  and  completions[-1].type == 'global') :
         e = struct()
         e.type = 'spill'
-	      e.completion = b.interval
-	      e.index = i
+        e.completion = b.interval
+        e.index = i
         completions[:0] = [e]
       #a always goes in (first)
-      if i == a.spillover  
+      if i == a.spillover : 
         e = struct()
         e.type = 'pivot'
-	      e.completion = a.interval
-	      e.index = i
+        e.completion = a.interval
+        e.index = i
         completions[:0] = [e]
-	  
+  
       h.dim[:0] = [ completions ]  #prepend. 
+ 
+    #from pdb import set_trace; set_trace()
+    assert(len(h.dim) ==  D)
+    #yay, inputs structure for read is complete
+    return h
 
-      assert(len(h.dim) ==  D)
-      #yay, inputs structure for read is complete
 
 
+def arbelo_cascade( dims, shape, out, a, b ) : 
+    D = len(shape)
+    layers, next_dim_layer = [], [[]]  #a layer is a list of lists of codims, and layers is a list of layers. Need inner [] for reference
+    
+    #from pdb import set_trace; set_trace()
+    for dim in reversed(dims) :  #top down construction
+      j = len(dim) - 1 
+
+      codim = struct()
+      codim.completion = dim[j].completion
+      codim.type = dim[j].type  #going to be redundant but I don't have a struct for layer per se
+      next_dim_layer[0].append( codim )  #update the empty codim list, reference 
+      #layers[:0] = [ next_dim_layer ]   this syntax is too confusing. If I forget the [], it will shave off a layer
+      layers.insert(0, next_dim_layer) #prepend
+      placeholders, next_dim_layer, next_placeholders = next_dim_layer, [[]], []   #next dim layer empty inner list is important
+      while j > 0 : #ie there is a higher and lower dim
+        assert(type(dim[j].completion) is int  and  dim[j].completion >= dim[j-1].completion)
+        for cdl in placeholders : #residualize each codim list of 1 in placeholder layer
+          assert( len(cdl) == 1 )
+          mulc, trivc, sizec, resc = struct(), struct(), struct(), struct()
+          mul = cdl[0].completion / dim[j-1].completion
+          res = cdl[0].completion % dim[j-1].completion
+          mulc.completion,  mulc.next,   mulc.type   =  mul, [sizec], cdl[0].type 
+          trivc.completion, trivc.next,  trivc.type  =  1,   [resc],  cdl[0].type
+          cdl[:] = [mulc, trivc]  #references, updating 
+          sizec.completion, resc.completion  =  dim[j-1].completion, res 
+          sizec.type, resc.type  =  dim[j-1].type, dim[j-1].type 
+          #make sure placeholder list is updated, so next link to placeholder remains valid  
+          next_placeholders.extend([ mulc.next, trivc.next ])  #references  ([ goes with extend, not a new list)
+        placeholders, next_placeholders = next_placeholders, []
+        layers.insert(0, placeholders) #prepend
+        j = j - 1
+      #wrap up last layer
+      for cdl in placeholders : 
+        assert( len(cdl) == 1 )
+        cdl[0].next = next_dim_layer[0]  #note: preserve empty list reference later
+
+    return layers 
     #Then unroll segments for prec, by splitting h into inner and outer (incl second loop), ie all layers of a, and remainder without global, 
     #but so that the || codims result in separate unrolls (which I might do special unroll just for that layer, so other precalc arrays are same).
+
+
+
+
