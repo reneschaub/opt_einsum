@@ -682,7 +682,7 @@ def arbelo_cascade( dims, shape, out, a, b ) :
 
       codim = struct()
       codim.completion = dim[j].completion
-      codim.type = dim[j].type  #going to be redundant but I don't have a struct for layer per se
+      codim.type, codim.index = dim[j].type, dim[j].index  #going to be redundant but I don't have a struct for layer per se
       next_dim_layer[0].append( codim )  #update the empty codim list, reference 
       #layers[:0] = [ next_dim_layer ]   this syntax is too confusing. If I forget the [], it will shave off a layer
       layers.insert(0, next_dim_layer) #prepend
@@ -694,11 +694,12 @@ def arbelo_cascade( dims, shape, out, a, b ) :
           mulc, trivc, sizec, resc = struct(), struct(), struct(), struct()
           mul = cdl[0].completion / dim[j-1].completion
           res = cdl[0].completion % dim[j-1].completion
-          mulc.completion,  mulc.next,   mulc.type   =  mul, [sizec], cdl[0].type 
-          trivc.completion, trivc.next,  trivc.type  =  1,   [resc],  cdl[0].type
+          step = dim[j-1].completion
+          mulc.completion,  mulc.next,   mulc.type,  mulc.index,  mulc.step    =  mul, [sizec], cdl[0].type, cdl[0].index, step
+          trivc.completion, trivc.next,  trivc.type, trivc.index, trivc.step   =  1,   [resc],  cdl[0].type, cdl[0].index, step
           cdl[:] = [mulc, trivc]  #references, updating 
           sizec.completion, resc.completion  =  dim[j-1].completion, res 
-          sizec.type, resc.type  =  dim[j-1].type, dim[j-1].type 
+          sizec.type, sizec.index, resc.type, resc.index  =  dim[j-1].type, dim[j-1].index, dim[j-1].type, dim[j-1].index
           #make sure placeholder list is updated, so next link to placeholder remains valid  
           next_placeholders.extend([ mulc.next, trivc.next ])  #references  ([ goes with extend, not a new list)
         placeholders, next_placeholders = next_placeholders, []
@@ -707,11 +708,32 @@ def arbelo_cascade( dims, shape, out, a, b ) :
       #wrap up last layer
       for cdl in placeholders : 
         assert( len(cdl) == 1 )
+        cdl[0].step = 1
         cdl[0].next = next_dim_layer[0]  #note: preserve empty list reference later
 
     return layers 
+
+
+def count( codims, scalar,  a ) :
+  #leaf
+  if codims == [] :
+    print( scalar )
+    return
+
+  #codims are counted left to right, and with previous total added in
+  total = 0
+  for codim in codims : 
+    for i in range(codim.completion) :
+      block_scalar = a.block[codim.index] * codim.step * i  
+      count( codim.next, scalar + total + block_scalar,  a )
+    total = total  + a.block[codim.index] * codim.step * codim.completion
+
+
     #Then unroll segments for prec, by splitting h into inner and outer (incl second loop), ie all layers of a, and remainder without global, 
     #but so that the || codims result in separate unrolls (which I might do special unroll just for that layer, so other precalc arrays are same).
+
+
+
 
 
 
