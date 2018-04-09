@@ -714,6 +714,8 @@ def arbelo_cascade( dims, shape, out, a, b ) :
     return layers 
 
 
+#counts up the global memory using codim decomposition
+#codims: top level list of codims (not layer). scalar: should be 0 to start
 def count( codims, scalar,  a ) :
   #leaf
   if codims == [] :
@@ -729,12 +731,101 @@ def count( codims, scalar,  a ) :
     total = total  + a.block[codim.index] * codim.step * codim.completion
 
 
-    #Then unroll segments for prec, by splitting h into inner and outer (incl second loop), ie all layers of a, and remainder without global, 
-    #but so that the || codims result in separate unrolls (which I might do special unroll just for that layer, so other precalc arrays are same).
+
+def precalc( layers, a ) : 
+  #break layers into unroll segments (and dependent)
+
+  #Branch = codim list > 1 entry.
+  #The up to 4 paths (2 branches) branch either on global or local owner. In the latter, both paths are executed (in a single thread block) so
+  #no identification takes place. In the former, the global thread block is reverse mapped to determine the path. The paths are split 
+  #into global (no unrolling), and local before and after pivot (both unrolled). The spillover cases do not determine anything here.
+  #(the global reverse mapping may include full local dimensions as well to get to lower global dim)
+
+  #Do it in one shot: enumerate the paths 1,2,3,4: 1st split: +0/+2, second split: +0/+1. Eg for path 2 (0,1,2,3), right on first split, left on 2nd.
+  #In first pass count all local segments up to pivot and write out before hitting pivot (at which all branches have been traveled so path is identified)
+  #in outer loop array for path. On second pass, start counting out locals after and including pivot, and write into another set of arrays.
+
+
+  #loop: 'inner' or 'outer', path: 0-3, prec: list of unrolled addresses, scalar: 0. pivoted: False
+  #could generalize this to any branching/codims structure, hardcoded for up to 2*2 right now
+  #also note, if there is only one split, two of the paths are repeated/won't be identified later but that's fine.
+  #TODO: path should be encoded as list of branches, so it isn't hardcoded
+  def unroll( codims, scalar, path, loop, prec, pivoted, a ) :
+    #leaf
+    if codims == [] :  #write out to inner segment
+      prec.append( scalar )  
+      return
+    
+    #codims are counted left to right, and with previous total added in (this really sucks hardcoded. Use list of branches instead)
+    #branch
+    total = 0; branch = 0
+    if len(codims) > 1 : #branch
+      branch, path = path / 2, path % 2
+      if branch == 1 :
+        total = total  + a.block[codims[0].index] * codims[0].step * codims[0].completion
+    codim = codims[branch]
+
+    if codim.type == 'pivot' and loop == 'outer' : #write out to outer segment. Could also just have checked first codim.
+      prec.append( scalar )
+      return 
+
+    if codim.type == 'pivot' and loop == 'inner' : #start counting
+      pivoted = True
+    if ((loop == 'inner' and pivoted and (codim.type == 'pivot' or codim.type == 'local'))  #count. Unnecessary checks as all layers below pivot are local.
+     or (loop == 'outer' and codim.type == 'local')) : #count. This can only happen in shared spillover
+      for i in range(codim.completion) :
+        block_scalar = a.block[codim.index] * codim.step * i  
+        unroll( codim.next, scalar + total + block_scalar, path, loop, prec, pivoted, a )
+    else : #don't count
+      unroll( codim.next, scalar, path, loop, prec, pivoted, a )
+
+  paths = []
+  for i in range(4) : #2*2 paths
+    outer, inner = [], []
+    #from pdb import set_trace; set_trace()
+    unroll( layers[-1][0], 0, i, 'outer', outer, False, a ) 
+    unroll( layers[-1][0], 0, i, 'inner', inner, False, a ) 
+    paths.append( (outer, inner) )
+
+  return paths
 
 
 
+#turn global block scalar into global indices, allowing to get global address part, and select branch
+#pass in [] for branches, will have branch decisions 0=left, 1=right (since only 2 branches max here)
+#pass in struct for address with it = 0 attribute
+def reverse_cascade( codims, scalar, branches, address, a, g ) :
+
+  #don't save the indices, translate into global address right away
+
+  i = 0
+  if len(codims) > 1 and codims[0].type == 'global' :  #(all codims in a list have same type)
+
+    #which branch is active
+    branch_size =  g.block[codims[i].index] * codims[i].step * codims[i].completion
+    address_size = a.block[codims[i].index] * codims[i].step * codims[i].completion
+    i = 1
+    while i < len(codims) and scalar >= branch_size : 
+      scalar = scalar - branch_size
+      address.it = address.it + address_size
+      branch_size  = g.block[codims[i].index] * codims[i].step * codims[i].completion
+      address_size = a.block[codims[i].index] * codims[i].step * codims[i].completion
+      i = i + 1
+    assert( scalar < branch_size )
+    i = i - 1
+    #from pdb import set_trace; set_trace()
+    branches.append(i)
+
+  if len(codims) > 0 : 
+    index = scalar / (g.block[codims[i].index] * codims[i].step)
+    res =   scalar % (g.block[codims[i].index] * codims[i].step) 
+    address.it = address.it + a.block[codims[i].index] * codims[i].step * index
+    reverse_cascade( codims[i].next, res, branches, address, a, g )
 
 
-
+#get path number from branch decisions. Hardcoded to match earlier use (needs to know number of branching decisions)
+def path_is( branches ) :
+  i = branches[0]*2
+  if len(branches) == 2 : i = i + branches[1] 
+  return i
 
